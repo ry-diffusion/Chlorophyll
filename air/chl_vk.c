@@ -375,6 +375,9 @@ struct chl_device {
    const nir_shader_compiler_options *nir_options;
    unsigned align;                   /* descriptor offset alignment (64 on Turnip) */
    VkSampler default_sampler;
+   /* bound in every texture slot nothing is bound to: Turnip's null descriptor would send the fetch the shader still makes
+    * (the null mask only discards its result) to GPU address 0 + offset, an SMMU fault on this kernel */
+   struct chl_texture *null_tex;
 
    /* work that has to reach the GPU before anything committed after it: image layout transitions, uploads */
    pthread_mutex_t pro_lock;
@@ -777,6 +780,16 @@ chl_device_open(char *why, size_t why_size)
       say(why, why_size, "no completion thread");
       goto fail;
    }
+   {
+      static const struct chl_texture_desc nd = { .pixel_format = 80 /* BGRA8Unorm */, .type = CHL_TEX_2D, .width = 1, .height = 1,
+                                                  .depth = 1, .array_length = 1, .mip_levels = 1, .sample_count = 1,
+                                                  .usage = CHL_USAGE_SHADER_READ | CHL_USAGE_SHADER_WRITE };
+      static const uint8_t zero[4] = { 0, 0, 0, 0 };
+      char nwhy[256];
+      d->null_tex = chl_texture_create(d, &nd, nwhy, sizeof(nwhy));
+      if (d->null_tex)
+         chl_texture_replace(d->null_tex, 0, 0, NULL, NULL, zero, 4, 0, nwhy, sizeof(nwhy));
+   }
    return d;
 
 fail:
@@ -800,6 +813,8 @@ chl_device_close(struct chl_device *d)
    pthread_mutex_unlock(&d->done_lock);
    pthread_join(d->thread, NULL);
    d->vk.vkDeviceWaitIdle(d->dev);
+   if (d->null_tex)
+      chl_texture_release(d->null_tex);
    pthread_mutex_lock(&d->pro_lock);
    pro_reap(d, true);
    pthread_mutex_unlock(&d->pro_lock);
@@ -2153,6 +2168,10 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
             level = tx && l->level[i] >= tx->levels ? tx->levels - 1 : l->level[i];
          }
          VkImageView v = VK_NULL_HANDLE;
+         if (!tx) {
+            tx = d->null_tex;
+            level = 0;
+         }
          if (tx)
             v = t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? storage_view(tx, level) : tx->view;
          ii[nw] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL };
