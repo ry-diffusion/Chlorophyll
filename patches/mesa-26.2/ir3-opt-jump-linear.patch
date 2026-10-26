@@ -1,0 +1,61 @@
+diff --git a/src/freedreno/ir3/ir3_legalize.c b/src/freedreno/ir3/ir3_legalize.c
+index 02c3812..eb163a9 100644
+--- a/src/freedreno/ir3/ir3_legalize.c
++++ b/src/freedreno/ir3/ir3_legalize.c
+@@ -1107,12 +1107,8 @@ retarget_jump(struct ir3_instruction *instr, struct ir3_block *new_target)
+ 
+    instr->cat0.target = new_target;
+ 
+-   if (old_target->predecessors_count == 0) {
+-      remove_unused_block(old_target);
+-      return true;
+-   }
+-
+-   return false;
++   /* the caller removes it once its walk over the blocks is done */
++   return old_target->predecessors_count == 0;
+ }
+ 
+ static bool
+@@ -1139,6 +1135,13 @@ opt_jump(struct ir3 *ir)
+    foreach_block (block, &ir->block_list)
+       block->index = index++;
+ 
++   /* Blocks a retargeting leaves without predecessors are removed after the walk. Removing one in the middle of it meant
++    * restarting the whole walk after every such retargeting, quadratic in the number of blocks: 77 s in ir3_legalize for
++    * CoreAnimation's largest fragment shader (Chlorophyll on Turnip, 2026-10-26).
++    */
++   struct ir3_block **unused = malloc(MAX2(index, 1) * sizeof(*unused));
++   unsigned n_unused = 0;
++
+    foreach_block (block, &ir->block_list) {
+       /* This pass destroys the physical CFG so don't keep it around to avoid
+        * validation errors.
+@@ -1154,11 +1157,9 @@ opt_jump(struct ir3 *ir)
+          if (tblock != instr->cat0.target) {
+             progress = true;
+ 
+-            /* Exit early if we deleted a block to avoid iterator
+-             * weirdness/assert fails
+-             */
+-            if (retarget_jump(instr, tblock))
+-               return true;
++            struct ir3_block *old_target = instr->cat0.target;
++            if (retarget_jump(instr, tblock) && n_unused < index)
++               unused[n_unused++] = old_target;
+          }
+       }
+ 
+@@ -1197,6 +1198,12 @@ opt_jump(struct ir3 *ir)
+       }
+    }
+ 
++   for (unsigned i = 0; i < n_unused; i++) {
++      if (unused[i]->predecessors_count == 0)   /* nothing jumped back to it later in the walk */
++         remove_unused_block(unused[i]);
++   }
++   free(unused);
++
+    return progress;
+ }
+ 
