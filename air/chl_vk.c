@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -664,6 +665,29 @@ chl_device_open(char *why, size_t why_size)
             flags[strcspn(flags, "\r\n")] = 0;
             if (flags[0])
                setenv("TU_DEBUG", flags, 1);
+         }
+         fclose(f);
+      }
+   }
+
+   /* /private/var/tmp/chl.rddump: process names, one a line, whose submits Turnip records for cffdump (FD_RD_DUMP=enable:
+    * command streams, descriptor pools and the address of every BO, one gzipped .rd per submit) into
+    * /private/var/tmp/chl-rd/<name>-<pid>. Nothing trims that directory: whoever arms it keeps the newest files. */
+   if (!getenv("FD_RD_DUMP")) {
+      FILE *f = fopen("/private/var/tmp/chl.rddump", "r");
+      if (f) {
+         char line[128];
+         while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (!line[0] || strcmp(line, getprogname()))
+               continue;
+            char dir[256];
+            snprintf(dir, sizeof(dir), "/private/var/tmp/chl-rd/%s-%d", line, getpid());
+            if (mkdir(dir, 0700) == 0 || errno == EEXIST) {
+               setenv("FD_RD_DUMP_PATH", dir, 1);
+               setenv("FD_RD_DUMP", "enable", 1);
+            }
+            break;
          }
          fclose(f);
       }
