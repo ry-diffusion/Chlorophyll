@@ -130,22 +130,38 @@ bg_fail_dump(const char *reason, NSData *vair, NSString *vname, NSData *air, NSS
 // pipeline is refused. A diagnostic for a shader that hangs the GPU: the process keeps running and the shader can be examined
 // on the Mac (air_vk_check) without spending one of the kernel's GPU recoveries. Read once per process.
 static BOOL
-bg_refused(NSString *fname)
+bg_prefix_listed(NSString *path, NSString *fname, NSArray **cache, dispatch_once_t *once)
 {
-   static NSArray *prefixes;
-   static dispatch_once_t once;
-   dispatch_once(&once, ^{
-      NSString *t = [NSString stringWithContentsOfFile:@"/private/var/tmp/bgmtl.refuse" encoding:NSUTF8StringEncoding error:NULL];
+   dispatch_once(once, ^{
+      NSString *t = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
       NSMutableArray *a = [NSMutableArray array];
       for (NSString *l in [t componentsSeparatedByString:@"\n"]) {
          NSString *w = [l stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
          if (w.length && ![w hasPrefix:@"#"]) [a addObject:w];
       }
-      prefixes = [a copy];
+      *cache = [a copy];
    });
-   for (NSString *p in prefixes)
+   for (NSString *p in *cache)
       if (fname && [fname hasPrefix:p]) return YES;
    return NO;
+}
+
+static BOOL
+bg_refused(NSString *fname)
+{
+   static NSArray *prefixes;
+   static dispatch_once_t once;
+   return bg_prefix_listed(@"/private/var/tmp/bgmtl.refuse", fname, &prefixes, &once);
+}
+
+// /private/var/tmp/bgmtl.dumpair: the same kind of list; those pipelines' AIR (with the linked functions) goes to
+// /private/var/tmp/bgmtl-refused/ too, but they are built and drawn as usual (the AIR RenderBox specializes at run time)
+static BOOL
+bg_dump_listed(NSString *fname)
+{
+   static NSArray *prefixes;
+   static dispatch_once_t once;
+   return bg_prefix_listed(@"/private/var/tmp/bgmtl.dumpair", fname, &prefixes, &once);
 }
 
 static void
@@ -1097,6 +1113,12 @@ bg_air_slice(NSData *d)
          if (!l) continue;
          pd.layout[k] = (struct chl_vertex_layout){ (unsigned)[l stride], (unsigned)[l stepFunction], (unsigned)[l stepRate] };
       }
+   }
+   if (fragment && bg_dump_listed([fragment name])) {
+      struct chl_linked_function all[32];
+      memcpy(all, vlk, nvl * sizeof(vlk[0]));
+      memcpy(all + nvl, flk, nfl * sizeof(flk[0]));
+      bg_refuse_dump(vair, [vertex name], fair, [fragment name], all, nvl, nfl);
    }
    if (fragment && bg_refused([fragment name])) {
       struct chl_linked_function all[32];
