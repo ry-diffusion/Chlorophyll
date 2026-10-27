@@ -2154,11 +2154,21 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
    uint32_t push[64] = { 0 };
    unsigned nw = 0;
    for (unsigned i = 0; i < AIR_VK_MAX_BINDINGS; i++) {
-      if (!l->bindings.type[i] || l->immutable[i])
+      if (!l->bindings.type[i])
          continue;
       if (nw == 32) {
          say(why, why_size, "more than 32 resources in one draw or dispatch");
          return -1;
+      }
+      if (l->immutable[i]) {
+         /* Turnip copies a push set's immutable sampler into it only when the push names that binding. Unnamed, the slot
+          * kept stale command-stream memory, and its border-colour index sent the GPU to border-colour base + garbage x 128:
+          * the wild-address SMMU faults of SpringBoard and backboardd (2026-10-27, FAR matched to the byte). */
+         ii[nw] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+         w[nw] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, i, 0, 1,
+                                         VK_DESCRIPTOR_TYPE_SAMPLER, &ii[nw], NULL, NULL };
+         nw++;
+         continue;
       }
       unsigned stage = i / AIR_VK_STAGE_BINDINGS, local = i % AIR_VK_STAGE_BINDINGS;
       const struct chl_stage_bind *sb = &cb->bind[stage];
