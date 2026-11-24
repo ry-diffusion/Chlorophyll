@@ -1,3 +1,31 @@
+diff --git a/crates/metal2vulkan-air/src/canon/link.rs b/crates/metal2vulkan-air/src/canon/link.rs
+index 9c0c08f..c6686df 100644
+--- a/crates/metal2vulkan-air/src/canon/link.rs
++++ b/crates/metal2vulkan-air/src/canon/link.rs
+@@ -541,7 +541,22 @@ fn link_in(
+                 .filter(|(_, f)| *f.name == *symbol.0)
+                 .map(move |(j, f)| ((i, j), l, f))
+         });
+-        let state = match (named.next(), named.next()) {
++        let (first, second) = (named.next(), named.next());
++        // Chlorophyll (iOS 26 RenderBox): a custom effect's stage calls `custom_fn`, and the pipeline links one private
++        // function of another name (`clampToEdges_v1`, `simplifiedShapeAwareGradientMask_v1`); as Chlorophyll's own
++        // translator, a stub no linked function names takes the only function linked.
++        let (first, second) = if first.is_none() {
++            let mut every = linked.iter().enumerate().flat_map(|(i, l)| {
++                l.functions.iter().enumerate().map(move |(j, f)| ((i, j), l, f))
++            });
++            match (every.next(), every.next()) {
++                (Some(only), None) => (Some(only), None),
++                _ => (None, None),
++            }
++        } else {
++            (first, second)
++        };
++        let state = match (first, second) {
+             (None, _) => Stub::Missing(symbol),
+             (Some(_), Some(_)) => Stub::Refused(link_problem(&symbol.0, LinkProblem::Ambiguous)),
+             (Some((at, l, f)), None) => {
 diff --git a/crates/metal2vulkan-runtime/src/dma_buf.rs b/crates/metal2vulkan-runtime/src/dma_buf.rs
 index 8781adf..1ad421c 100644
 --- a/crates/metal2vulkan-runtime/src/dma_buf.rs

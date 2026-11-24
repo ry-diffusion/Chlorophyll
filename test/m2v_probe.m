@@ -7,6 +7,12 @@
 #import <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+@interface NSObject (M2VPrivate)
+- (id)newTextureWithBytesNoCopy:(void *)p length:(NSUInteger)l descriptor:(MTLTextureDescriptor *)d deallocator:(id)dealloc;
+@end
 
 int
 main(void)
@@ -62,6 +68,16 @@ main(void)
          IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
       }
       CFRelease(sf);
+      // 3. a texture over plain memory with length 0 (SpringBoard's icon images): rows packed
+      void *mem = NULL;
+      posix_memalign(&mem, 16384, 64 * 64 * 4);
+      memset(mem, 0x5a, 64 * 64 * 4);
+      MTLTextureDescriptor *nd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+      id<MTLTexture> nt = [(id)dev newTextureWithBytesNoCopy:mem length:0 descriptor:nd deallocator:nil];
+      uint32_t got = 0;
+      if (nt) [nt getBytes:&got bytesPerRow:256 fromRegion:MTLRegionMake2D(5, 5, 1, 1) mipmapLevel:0];
+      printf("no-copy texture (length 0): %s, texel 0x%08x (want 0x5a5a5a5a), usage %lu storage %lu\n", nt ? "made" : "refused", got,
+             (unsigned long)nd.usage, (unsigned long)nd.storageMode);
    }
    return 0;
 }

@@ -1,5 +1,5 @@
 diff --git a/userland/metal2/NativeBridgeMetalFrontend.mm b/userland/metal2/NativeBridgeMetalFrontend.mm
-index 96a3488..0ea96f5 100644
+index 96a3488..5e68281 100644
 --- a/userland/metal2/NativeBridgeMetalFrontend.mm
 +++ b/userland/metal2/NativeBridgeMetalFrontend.mm
 @@ -69,7 +69,7 @@
@@ -247,7 +247,29 @@ index 96a3488..0ea96f5 100644
  - (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {(void)d;return [self commandBuffer];}
  @end
  
-@@ -2118,6 +2262,9 @@ - (MTLSize)maxThreadsPerThreadgroup {
+@@ -1724,6 +1868,21 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+   if(error)*error=nbError(@"foreign function");return false;
+  }
+  p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
++ // Chlorophyll: RenderBox's custom effects link `custom_fn` (fragmentLinkedFunctions); the lists live until the next call on this thread
++ {
++  static thread_local std::vector<NmbFunction *> vertexLinked,fragmentLinked;
++  auto collect=[](MTLLinkedFunctions *l,std::vector<NmbFunction *> &v)->bool{
++   v.clear();
++   for(NSArray *list in @[l.functions?:@[],l.privateFunctions?:@[]])for(id f in list){
++    if(![f isKindOfClass:[NBFunction class]])return false;
++    v.push_back([(NBFunction *)f handle]);
++   }
++   return true;
++  };
++  if(!collect(d.vertexLinkedFunctions,vertexLinked) || !collect(d.fragmentLinkedFunctions,fragmentLinked)){if(error)*error=nbError(@"foreign linked function");return false;}
++  p->vertex_linked=vertexLinked.data();p->vertex_linked_count=vertexLinked.size();
++  p->fragment_linked=fragmentLinked.data();p->fragment_linked_count=fragmentLinked.size();
++ }
+  for(unsigned i=0;i<8;i++) {
+   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];
+   p->colors[i]={sweetNarrow(a.pixelFormat),(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
+@@ -2118,6 +2277,9 @@ - (MTLSize)maxThreadsPerThreadgroup {
   uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))NBLOG(@"native-metal: maxThreadsPerThreadgroup: %@",lastError());
   return MTLSizeMake(s[0],s[1],s[2]);
  }
@@ -257,7 +279,35 @@ index 96a3488..0ea96f5 100644
  - (void)doesNotRecognizeSelector:(SEL)selector {
   if(gMissing)gMissing("NativeBridgeMetalDevice",sel_getName(selector));
   noteProblem([NSString stringWithFormat:@"missing device %s",sel_getName(selector)]);
-@@ -2210,9 +2357,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
+@@ -2158,6 +2320,27 @@ - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources c
+ // gets the pitch its length implies where the required one does not fit.
+ - (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {
+  const size_t page=(size_t)getpagesize();
++ // Chlorophyll: SpringBoard's icon images come with length 0 (rows packed, as Chlorophyll's BGMTLTexture reads them), and our
++ // kernel maps no plain memory for the GPU: a texture of its own, filled once from the caller's bytes (rows of length/height).
++ // shortcut: not refreshed if the caller writes its bytes later; refresh at commit (as no-copy buffers) if a client does.
++ uint32_t cbw=0,cbh=0,cbb=0;
++ if(!length && d) {   // length 0: packed rows of blocks or texels (SpringBoard's compressed icon images among them)
++  if(sweetBlock(d.pixelFormat,&cbw,&cbh,&cbb))length=(d.width+cbw-1)/cbw*cbb*((d.height+cbh-1)/cbh);
++  else length=d.width*sweetTexelBytes(d.pixelFormat)*d.height;
++ }
++ if(bytes && d && d.textureType==MTLTextureType2D && d.mipmapLevelCount<=1 && d.arrayLength<=1 && d.sampleCount<=1 && !sweetBlock(d.pixelFormat,&cbw,&cbh,&cbb)) {
++  const NSUInteger texel=sweetTexelBytes(d.pixelFormat),row=length?length/MAX(d.height,(NSUInteger)1):d.width*texel;
++  if(texel && row>=d.width*texel) {
++   MTLTextureDescriptor *own=[d copy];
++   own.storageMode=MTLStorageModeShared;
++   id<MTLTexture> texture=[(id<MTLDevice>)self newTextureWithDescriptor:own];
++   if(!texture)return nil;
++   [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:row];
++   SweetMemoryOwner *owner=[SweetMemoryOwner new];owner.deallocator=deallocator;owner.bytes=bytes;owner.length=length?length:row*d.height;
++   objc_setAssociatedObject(texture,&sweetMemoryOwnerKey,owner,OBJC_ASSOCIATION_RETAIN);
++   return texture;
++  }
++ }
+  if(!bytes || !d || !length || ((uintptr_t)bytes&(page-1)) || d.textureType!=MTLTextureType2D || d.mipmapLevelCount>1 || d.arrayLength>1 || d.sampleCount>1){
+   NBLOG(@"native-metal: newTextureWithBytesNoCopy refused (%p %lu type %lu levels %lu)",bytes,(unsigned long)length,(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount);
+   return nil;
+@@ -2210,9 +2393,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
  }
  - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
   NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,pointer,length,options);
@@ -279,8 +329,20 @@ index 96a3488..0ea96f5 100644
   return (id<MTLBuffer>)buffer;
  }
  - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
+@@ -2481,6 +2676,11 @@ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)opt
+  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+  if(!handle){NBLOG(@"native-metal: render pipeline refused (vertex %@, fragment %@): %@",d.vertexFunction.name,d.fragmentFunction.name,lastError());
++  {static std::atomic<int> said{0};if(said++<6){   // Chlorophyll: which linked functions came with it
++   NSMutableString *names=[NSMutableString string];
++   for(MTLLinkedFunctions *l in @[d.vertexLinkedFunctions?:[MTLLinkedFunctions linkedFunctions],d.fragmentLinkedFunctions?:[MTLLinkedFunctions linkedFunctions]])
++    for(NSArray *list in @[l.functions?:@[],l.privateFunctions?:@[],l.binaryFunctions?:@[]])for(id f in list)[names appendFormat:@" %@(%s)",[f name],class_getName([f class])];
++   NBLOG(@"chl: linked functions given:%@ (vertex %lu, fragment %lu functions)",names,(unsigned long)d.vertexLinkedFunctions.functions.count,(unsigned long)d.fragmentLinkedFunctions.functions.count);}}
+   return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);}
+  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
+  {// 0182: what the pipeline is, for the draw trace of full-screen surface textures
 diff --git a/userland/metal2/bridge/NativeMetalObjects.h b/userland/metal2/bridge/NativeMetalObjects.h
-index cc22052..7e07d88 100644
+index cc22052..a7939c5 100644
 --- a/userland/metal2/bridge/NativeMetalObjects.h
 +++ b/userland/metal2/bridge/NativeMetalObjects.h
 @@ -64,6 +64,9 @@ bool nmb_binary_archive_serialize(NmbBinaryArchive *, const char *path);
@@ -293,11 +355,63 @@ index cc22052..7e07d88 100644
  void nmb_buffer_release(NmbBuffer *);
  void *nmb_buffer_contents(const NmbBuffer *);
  uint64_t nmb_buffer_length(const NmbBuffer *);
+@@ -131,6 +134,9 @@ struct NmbRenderPipelineDescriptor {
+     uint64_t vertex_inputs; /* 0: no vertex descriptor */
+     struct NmbVertexAttribute attributes[31];
+     struct NmbVertexLayout layouts[31];
++    /* Chlorophyll: MTLRenderPipelineDescriptor's vertex/fragmentLinkedFunctions (functions + privateFunctions), valid for the call */
++    NmbFunction *const *vertex_linked; size_t vertex_linked_count;
++    NmbFunction *const *fragment_linked; size_t fragment_linked_count;
+ };
+ NmbRenderPipeline *nmb_render_pipeline_new(NmbDevice *, const struct NmbRenderPipelineDescriptor *);
+ /* Descriptor binaryArchives and MTLPipelineOption bits. NULL options means defaults.
 diff --git a/userland/metal2/bridge/NativeMetalObjects.rs b/userland/metal2/bridge/NativeMetalObjects.rs
-index d9d23cd..a0516c0 100644
+index d9d23cd..ea3929f 100644
 --- a/userland/metal2/bridge/NativeMetalObjects.rs
 +++ b/userland/metal2/bridge/NativeMetalObjects.rs
-@@ -2105,3 +2105,53 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
+@@ -1096,6 +1096,21 @@ pub struct NmbRenderPipelineDescriptor {
+     pub vertex_inputs: u64,
+     pub attributes: [NmbVertexAttribute; 31],
+     pub layouts: [NmbVertexLayout; 31],
++    pub vertex_linked: *const *mut NmbFunction,
++    pub vertex_linked_count: usize,
++    pub fragment_linked: *const *mut NmbFunction,
++    pub fragment_linked_count: usize,
++}
++
++/// Chlorophyll: a stage's linked functions (RenderBox's `custom_fn`) from the descriptor's list.
++fn linked_functions(list: *const *mut NmbFunction, count: usize) -> Result<metal2vulkan::pipeline::LinkedFunctions, String> {
++    let mut out = metal2vulkan::pipeline::LinkedFunctions::new();
++    for i in 0..count {
++        // SAFETY: the header's contract: `count` handles, valid for the call.
++        let f = unsafe { *list.add(i) };
++        out = out.with_function(get(f)?.0.linked_function());
++    }
++    Ok(out)
+ }
+ 
+ fn optional_format(value: u64) -> Result<Option<PixelFormat>, String> {
+@@ -1149,9 +1164,17 @@ pub unsafe extern "C" fn nmb_render_pipeline_new_with_options(device: *mut NmbDe
+ 
+ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<RenderPipelineDescriptor, String> {
+         let d = get(descriptor)?;
+-        let mut out = RenderPipelineDescriptor::new(StageSource::Function(get(d.vertex)?.0.function_descriptor()));
++        let mut vertex = get(d.vertex)?.0.function_descriptor();
++        if d.vertex_linked_count > 0 {
++            vertex = vertex.with_linked(linked_functions(d.vertex_linked, d.vertex_linked_count)?);
++        }
++        let mut out = RenderPipelineDescriptor::new(StageSource::Function(vertex));
+         if !d.fragment.is_null() {
+-            out.fragment = Some(StageSource::Function(get(d.fragment)?.0.function_descriptor()));
++            let mut fragment = get(d.fragment)?.0.function_descriptor();
++            if d.fragment_linked_count > 0 {
++                fragment = fragment.with_linked(linked_functions(d.fragment_linked, d.fragment_linked_count)?);
++            }
++            out.fragment = Some(StageSource::Function(fragment));
+         }
+         for (slot, c) in out.color_attachments.iter_mut().zip(d.colors.iter()) {
+             if c.format == 0 {
+@@ -2105,3 +2128,53 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
          Ok(true)
      })
  }
