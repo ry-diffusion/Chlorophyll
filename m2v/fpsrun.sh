@@ -25,14 +25,19 @@ if [ $inject = 1 ]; then
   T=90 P 'cat > /usr/local/lib/bgmtl/.inject.tmp' < "$W/out-metal/bgmtl-inject.dylib" &&
   P 'chmod 755 /usr/local/lib/bgmtl/.inject.tmp && mv /usr/local/lib/bgmtl/.inject.tmp /usr/local/lib/bgmtl/bgmtl-inject.dylib' || exit 1
 fi
-# The RAM-boot image: boot55 + enable_skstb (lets kern.sched_update_recommended_cores be written). A normal reboot would come
-# back on the installed boot partition, so reboots go through ABL fastboot and `fastboot boot` (nothing is flashed).
-IMG="${M2V_BOOT_IMG:-/Users/zesmoi/git/iAndroid/ios-beryllium/shim/out/enxerto-boot-ios26full-boot55-skstb.img}"
-CORES="${M2V_CORES:-0xf1}"   # CPU0 (the boot A55) + the four A75s
+# Since 2026-11-24 the boot partition holds boot56-recovery (panic reset, watchdog, sweetcores=0xf1 = CPU0 + A75s), so a
+# plain reboot keeps the big-core scheduling. M2V_BOOT_IMG=... RAM-boots another image instead (fastboot boot, not flashed);
+# M2V_CORES=MASK writes kern.sched_update_recommended_cores (needs an image with enable_skstb).
+IMG="${M2V_BOOT_IMG:-}"
+CORES="${M2V_CORES:-none}"
 if [ $reboot = 1 ]; then
-  P 'sync; sweetreboot fastboot' >/dev/null 2>&1
-  n=0; until fastboot devices 2>/dev/null | grep -q fastboot; do n=$((n+1)); [ $n -ge 120 ] && { echo "no fastboot"; exit 1; }; python3 -c 'import time; time.sleep(2)'; done
-  fastboot boot "$IMG" >/dev/null 2>&1 || { echo "fastboot boot failed"; exit 1; }
+  if [ -n "$IMG" ]; then
+    P 'sync; sweetreboot fastboot' >/dev/null 2>&1
+    n=0; until fastboot devices 2>/dev/null | grep -q fastboot; do n=$((n+1)); [ $n -ge 120 ] && { echo "no fastboot"; exit 1; }; python3 -c 'import time; time.sleep(2)'; done
+    fastboot boot "$IMG" >/dev/null 2>&1 || { echo "fastboot boot failed"; exit 1; }
+  else
+    P 'sync; sweetreboot normal' >/dev/null 2>&1
+  fi
   n=0; until [ $n -ge 3 ] && T=8 P true 2>/dev/null; do n=$((n+1)); [ $n -ge 150 ] && { echo "phone did not come back"; exit 1; }; done
   for i in $(seq 1 10); do T=13 P true; done   # let SpringBoard, backboardd and the posters settle
 fi
