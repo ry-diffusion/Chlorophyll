@@ -83,6 +83,134 @@ main(void)
          printf("swizzle: pipeline %d texture %d, its swizzle %u%u%u%u (want 2223), pixel 0x%08x 0x%08x, want 0x80ffffff: %s\n", ps != nil, st != nil, z.red,
                 z.green, z.blue, z.alpha, px[0], px[63], px[0] == 0x80ffffff && px[63] == 0x80ffffff ? "PASS" : "FAIL");
       }
+      // M2V_LINEAR16F=1: an icon's image as SpringBoard's RenderBox samples it: a 128x128 RGBA16Float texture over a buffer (rows of
+      // 1024 bytes, at M2V_LINEAR_OFFSET, default 0), white texels written before (and, a second texture, after) the texture is made.
+      // Drawn into a 128x128 BGRA8 target, every row must read back white.
+      if (getenv("M2V_LINEAR16F")) {
+         NSError *err = nil;
+         id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"/var/root/bg_render.metallib"] error:&err];
+         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+         pd.vertexFunction = [lib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [lib newFunctionWithName:@"bg_fs_tex"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         id<MTLRenderPipelineState> ps = pd.vertexFunction ? [dev newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+         const NSUInteger off = getenv("M2V_LINEAR_OFFSET") ? atoi(getenv("M2V_LINEAR_OFFSET")) : 0, N = 128, ROW = N * 8;
+         MTLTextureDescriptor *ld = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:N height:N mipmapped:NO];
+         ld.usage = MTLTextureUsageShaderRead; ld.storageMode = MTLStorageModeShared;
+         MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:N height:N mipmapped:NO];
+         rd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+         static const float tri[24] = {-1, -1, 0, 1, 1, 1, 1, 1, 3, -1, 0, 1, 1, 1, 1, 1, -1, 3, 0, 1, 1, 1, 1, 1};
+         id<MTLBuffer> vb = [dev newBufferWithBytes:tri length:sizeof tri options:MTLResourceStorageModeShared];
+         for (int late = 0; late < 2 && ps; late++) {
+            id<MTLBuffer> buf = [dev newBufferWithLength:off + ROW * N options:MTLResourceStorageModeShared];
+            uint16_t *h = (uint16_t *)((uint8_t *)buf.contents + off);
+            if (!late) for (NSUInteger k = 0; k < N * N * 4; k++) h[k] = 0x3c00;   // 1.0
+            id<MTLTexture> lt = [buf newTextureWithDescriptor:ld offset:off bytesPerRow:ROW];
+            if (late) for (NSUInteger k = 0; k < N * N * 4; k++) h[k] = 0x3c00;
+            id<MTLTexture> rt = [dev newTextureWithDescriptor:rd];
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = rt; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            id<MTLRenderCommandEncoder> re = lt ? [cb renderCommandEncoderWithDescriptor:rp] : nil;
+            [re setRenderPipelineState:ps];
+            [re setVertexBuffer:vb offset:0 atIndex:0];
+            [re setFragmentTexture:lt atIndex:0];
+            [re setFragmentSamplerState:[dev newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]] atIndex:0];
+            [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [re endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            static uint32_t px[128 * 128];
+            memset(px, 0, sizeof px);
+            if (lt) [rt getBytes:px bytesPerRow:N * 4 fromRegion:MTLRegionMake2D(0, 0, N, N) mipmapLevel:0];
+            NSUInteger white = 0, first = N;
+            for (NSUInteger y = 0; y < N; y++) {
+               bool all = true;
+               for (NSUInteger x = 0; x < N; x++) all = all && px[y * N + x] == 0xffffffff;
+               if (all) white++; else if (first == N) first = y;
+            }
+            printf("linear16f (offset %lu, texels written %s the texture): texture %d, %lu of %lu rows white, first other row %lu (0x%08x): %s\n", (unsigned long)off,
+                   late ? "after" : "before", lt != nil, (unsigned long)white, (unsigned long)N, (unsigned long)first, first < N ? px[first * N] : 0, white == N ? "PASS" : "FAIL");
+         }
+      }
+      // M2V_ASTC=1: RenderBox's glyph layers in SpringBoard ("rb:nocopy-data-texture"): a 132x132 ASTC 4x4 texture over the caller's
+      // blocks (newTextureWithBytesNoCopy:), every block a void-extent of opaque white. Drawn into a BGRA8 target, every row must
+      // read back white.
+      if (getenv("M2V_ASTC")) {
+         NSError *err = nil;
+         id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"/var/root/bg_render.metallib"] error:&err];
+         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+         pd.vertexFunction = [lib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [lib newFunctionWithName:@"bg_fs_tex"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         id<MTLRenderPipelineState> ps = pd.vertexFunction ? [dev newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+         const NSUInteger N = getenv("M2V_ASTC_N") ? MIN(atoi(getenv("M2V_ASTC_N")), 2048) : 132, B = (N + 3) / 4, LEN = B * B * 16, MAP = (LEN + 16383) & ~(NSUInteger)16383;
+         uint8_t *mem = NULL; posix_memalign((void **)&mem, 16384, MAP); memset(mem, 0, MAP);
+         static const uint8_t white[16] = {0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+         for (NSUInteger k = 0; k < B * B; k++) memcpy(mem + k * 16, white, 16);
+         if (getenv("M2V_ASTC_RAMP"))   // red is the block's row, green its column (both from 1), to see where each block lands
+            for (NSUInteger k = 0; k < B * B; k++) {
+               mem[k * 16 + 8] = mem[k * 16 + 9] = (uint8_t)(k / B + 1);
+               mem[k * 16 + 10] = mem[k * 16 + 11] = (uint8_t)(k % B + 1);
+            }
+         MTLTextureDescriptor *ad = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR width:N height:N mipmapped:NO];
+         ad.usage = MTLTextureUsageShaderRead; ad.storageMode = MTLStorageModeShared;
+         id<MTLTexture> at = [(id)dev newTextureWithBytesNoCopy:mem length:getenv("M2V_ASTC_EXACT") ? LEN : MAP descriptor:ad deallocator:nil];
+         if (getenv("M2V_ASTC_CONTROL")) {   // the same draw from a plain BGRA8 texture: what the target and the draw do by themselves
+            uint32_t *w8 = malloc(N * N * 4);
+            memset(w8, 0xff, N * N * 4);
+            at = [dev newTextureWithDescriptor:[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:N height:N mipmapped:NO]];
+            [at replaceRegion:MTLRegionMake2D(0, 0, N, N) mipmapLevel:0 withBytes:w8 bytesPerRow:N * 4];
+         }
+         MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:N height:N mipmapped:NO];
+         rd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+         id<MTLTexture> rt = [dev newTextureWithDescriptor:rd];
+         static const float tri[24] = {-1, -1, 0, 1, 1, 1, 1, 1, 3, -1, 0, 1, 1, 1, 1, 1, -1, 3, 0, 1, 1, 1, 1, 1};
+         id<MTLBuffer> vb = [dev newBufferWithBytes:tri length:sizeof tri options:MTLResourceStorageModeShared];
+         uint32_t *px = calloc(N * N, 4);
+         if (ps && at && rt) {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = rt; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+            [re setRenderPipelineState:ps];
+            [re setVertexBuffer:vb offset:0 atIndex:0];
+            [re setFragmentTexture:at atIndex:0];
+            [re setFragmentSamplerState:[dev newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]] atIndex:0];
+            [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [re endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            [rt getBytes:px bytesPerRow:N * 4 fromRegion:MTLRegionMake2D(0, 0, N, N) mipmapLevel:0];
+         }
+         NSUInteger white_rows = 0, first = N;
+         for (NSUInteger y = 0; y < N; y++) {
+            bool all = true;
+            for (NSUInteger x = 0; x < N; x++) all = all && px[y * N + x] == 0xffffffff;
+            if (all) white_rows++; else if (first == N) first = y;
+         }
+         if (getenv("M2V_ASTC_MAP"))   // one character a block: W all white, . none, + some
+            for (NSUInteger by = 0; by < B; by++) {
+               char line[520];
+               for (NSUInteger bx = 0; bx < B; bx++) {
+                  int w = 0, n = 0;
+                  for (NSUInteger y = by * 4; y < by * 4 + 4 && y < N; y++)
+                     for (NSUInteger x = bx * 4; x < bx * 4 + 4 && x < N; x++) { n++; w += px[y * N + x] == 0xffffffff; }
+                  line[bx] = w == n ? 'W' : w ? '+' : '.';
+               }
+               line[B] = 0;
+               printf("astc %2lu %s %08x %08x %08x\n", (unsigned long)by, line, px[by * 4 * N], px[by * 4 * N + N / 2], px[by * 4 * N + N - 1]);
+            }
+         if (getenv("M2V_ASTC_RAMP") && !getenv("M2V_ASTC_CONTROL") && N % 4 == 0 && B < 256) {   // every block where it belongs (the draw flips y)
+            NSUInteger wrong = 0;
+            for (NSUInteger by = 0; by < B; by++)
+               for (NSUInteger bx = 0; bx < B; bx++) wrong += px[(by * 4 + 1) * N + bx * 4 + 1] != (0xff0000ff | (uint32_t)(B - by) << 16 | (uint32_t)(bx + 1) << 8);
+            printf("astc ramp %lux%lu: %lu of %lu blocks misplaced: %s\n", (unsigned long)N, (unsigned long)N, (unsigned long)wrong, (unsigned long)(B * B), wrong ? "FAIL" : "PASS");
+         }
+         if (!getenv("M2V_ASTC_RAMP"))
+         printf("astc: pipeline %d texture %d (%lu bytes of blocks), %lu of %lu rows white, first other row %lu (0x%08x 0x%08x): %s\n", ps != nil, at != nil, (unsigned long)LEN,
+                (unsigned long)white_rows, (unsigned long)N, (unsigned long)first, first < N ? px[first * N] : 0, first < N ? px[first * N + N - 1] : 0, white_rows == N ? "PASS" : "FAIL");
+      }
       // M2V_RGB10A2=1: RenderBox's glass mask case (iconservicesagent): an RGB10A2Unorm render target over a no-copy buffer of plain
       // memory (rows 256 bytes, Metal's own 240), 60x60. (a) a clear pass: every texel must read back 0xC00003FF (R=1023, A=3);
       // (b) a load+store pass with no draw: the CPU's pattern must come back unchanged.
