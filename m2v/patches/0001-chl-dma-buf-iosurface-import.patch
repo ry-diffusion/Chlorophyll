@@ -1,5 +1,5 @@
 diff --git a/userland/metal2/NativeBridgeMetalFrontend.mm b/userland/metal2/NativeBridgeMetalFrontend.mm
-index 96a3488..23d55d2 100644
+index 96a3488..0ea96f5 100644
 --- a/userland/metal2/NativeBridgeMetalFrontend.mm
 +++ b/userland/metal2/NativeBridgeMetalFrontend.mm
 @@ -69,7 +69,7 @@
@@ -11,7 +11,37 @@ index 96a3488..23d55d2 100644
   return on;
  }
  static bool watchedSurface(IOSurfaceRef sf) {
-@@ -223,6 +223,7 @@ @interface NBBuffer : NBObject
+@@ -186,6 +186,21 @@ static void journal(const std::string &line) {
+  if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
+ }
+ 
++// Chlorophyll: a selector the frontend lacks is answered 0/nil (logged MISSING once) instead of an unrecognised-selector
++// abort, so one missing method does not crash SpringBoard into launchd's reboot limit. Forwarding (not
++// resolveInstanceMethod:) keeps respondsToSelector: truthful. shortcut: a float or large-struct return is not zeroed;
++// implement each MISSING selector properly as it shows up.
++static id chlZero(id self,SEL _cmd,...) {(void)self;(void)_cmd;return nil;}
++@interface ChlZeroSink : NSObject
++@end
++@implementation ChlZeroSink
+++ (BOOL)resolveInstanceMethod:(SEL)sel {class_addMethod(self,sel,(IMP)chlZero,"@@:");return YES;}
++@end
++static id chlForward(id self,SEL sel) {
++ static ChlZeroSink *sink=[ChlZeroSink new];
++ if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(sel));
++ return sink;
++}
+ @interface NBObject : NSObject
+ @property(atomic,copy) NSString *label;
+ @end
+@@ -193,6 +208,7 @@ @implementation NBObject
+ - (id<MTLDevice>)device {return gDeviceObject;}
+ // Metal SPI (Metal Performance Shaders asks every encoder and command buffer): an identity for its traces.
+ - (uint64_t)globalTraceObjectID {return (uint64_t)(uintptr_t)self;}
++- (id)forwardingTargetForSelector:(SEL)sel {return chlForward(self,sel);}
+ - (void)doesNotRecognizeSelector:(SEL)selector {
+  if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
+  noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
+@@ -223,6 +239,7 @@ @interface NBBuffer : NBObject
  @property(nonatomic) MTLResourceOptions options;
  @property(nonatomic,copy) void (^deallocator)(void *,NSUInteger);
  @property(nonatomic) void *wrapped;
@@ -19,7 +49,7 @@ index 96a3488..23d55d2 100644
  @property(nonatomic) IOSurfaceRef surfaceOwner; // keeps a shared import's CPU mapping alive
  @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
  @property(nonatomic) NSUInteger heapOffset;
-@@ -244,7 +245,7 @@ - (void)dealloc {
+@@ -244,7 +261,7 @@ - (void)dealloc {
   if(_surfaceOwner)CFRelease(_surfaceOwner);
  }
  - (NSUInteger)length {return nmb_buffer_length(_handle);}
@@ -28,7 +58,7 @@ index 96a3488..23d55d2 100644
  - (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
  - (MTLResourceOptions)resourceOptions {return _options;}
  - (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
-@@ -265,6 +266,111 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
+@@ -265,6 +282,111 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
  // and its retained surface prevent object/address reuse during a hit. A new
  // mapping, allocation identity or size needs a separate import; ordinary
  // caller-owned no-copy buffers do not enter this cache.
@@ -140,7 +170,7 @@ index 96a3488..23d55d2 100644
  static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
  static std::mutex gSurfaceImportLock;
  static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
-@@ -275,7 +381,8 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
+@@ -275,7 +397,8 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
   if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
   NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
   if(buffer)return buffer;
@@ -150,7 +180,7 @@ index 96a3488..23d55d2 100644
   if(!handle){NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
   buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
   buffer.surfaceOwner=(IOSurfaceRef)CFRetain(surface);
-@@ -853,7 +960,7 @@ - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const
+@@ -853,7 +976,7 @@ - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const
   for(NSUInteger k=0;k<r.length;k++)[self buffer:b[k] offset:o[k] index:r.location+k stage:0];
  }
  - (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:0];}
@@ -159,7 +189,7 @@ index 96a3488..23d55d2 100644
  - (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
   for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:0];
  }
-@@ -1109,6 +1216,16 @@ - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
+@@ -1109,6 +1232,16 @@ - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
         destinationLevel:level destinationOrigin:MTLOriginMake(0,0,0)];
   }
  }
@@ -176,7 +206,7 @@ index 96a3488..23d55d2 100644
  - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
              sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
       destinationOrigin:(MTLOrigin)dO {
-@@ -1289,7 +1406,9 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
+@@ -1289,7 +1422,9 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
   encoder.handle=handle;encoder.commandBuffer=self;return encoder;
  }
  - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
@@ -187,7 +217,7 @@ index 96a3488..23d55d2 100644
  }
  - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
   if(type!=MTLDispatchTypeSerial){[self refuse:@"concurrent compute dispatch"];return nil;}
-@@ -1356,6 +1475,11 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
+@@ -1356,6 +1491,11 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
   }
   id encoder=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
   if([encoder isKindOfClass:[NBRenderEncoder class]])((NBRenderEncoder *)encoder).drawableTarget=drawableTarget;
@@ -199,7 +229,7 @@ index 96a3488..23d55d2 100644
   if(traceOn() && [encoder isKindOfClass:[NBRenderEncoder class]]){   // 0182: the pass's colour target, for the draw trace (0242: tracing only)
    id<MTLTexture> t0=d.colorAttachments[0].texture;IOSurfaceRef sf=[(id)t0 isKindOfClass:[NBTexture class]]?[(NBTexture *)t0 surface]:nullptr;
    objc_setAssociatedObject(encoder,"target",[NSString stringWithFormat:@"%lux%lu fmt %lu surf %#x load %lu label %@",(unsigned long)t0.width,(unsigned long)t0.height,
-@@ -1501,6 +1625,8 @@ - (void)finish {
+@@ -1501,6 +1641,8 @@ - (void)finish {
  }
  - (void)commit {
   if(self.committed){NBLOG(@"native-metal: commit twice");return;}
@@ -208,7 +238,26 @@ index 96a3488..23d55d2 100644
   if(_rotatedShadows.count && !self.encodeFailure){   // 0196: what CA drew in landscape, into the portrait surface
    NSArray *shadows=[_rotatedShadows allObjects];[_rotatedShadows removeAllObjects];
    for(NBTexture *shadow in shadows){
-@@ -2210,9 +2336,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
+@@ -1636,6 +1778,8 @@ - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submissio
+ // GPU priorities are not applied (one hardware queue): reported as not applied.
+ - (BOOL)setGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
+ - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
++- (NSUInteger)getGPUPriority {return 0;}   // Chlorophyll: SpringBoard (iOS 26) asks; none applied
++- (NSUInteger)getBackgroundGPUPriority {return 0;}
+ - (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {(void)d;return [self commandBuffer];}
+ @end
+ 
+@@ -2118,6 +2262,9 @@ - (MTLSize)maxThreadsPerThreadgroup {
+  uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))NBLOG(@"native-metal: maxThreadsPerThreadgroup: %@",lastError());
+  return MTLSizeMake(s[0],s[1],s[2]);
+ }
++// Chlorophyll: SpringBoard (iOS 26) asks; Turnip's minTexelBufferOffsetAlignment on the A630
++- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)format {(void)format;return 64;}
++- (id)forwardingTargetForSelector:(SEL)sel {return chlForward(self,sel);}
+ - (void)doesNotRecognizeSelector:(SEL)selector {
+  if(gMissing)gMissing("NativeBridgeMetalDevice",sel_getName(selector));
+  noteProblem([NSString stringWithFormat:@"missing device %s",sel_getName(selector)]);
+@@ -2210,9 +2357,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
  }
  - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
   NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,pointer,length,options);

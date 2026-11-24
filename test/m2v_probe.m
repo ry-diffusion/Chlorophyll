@@ -19,6 +19,10 @@ main(void)
       printf("device: %s\n", dev ? [[dev name] UTF8String] : "refused (see /private/var/tmp/m2v.log)");
       if (!dev) return 1;
       id<MTLCommandQueue> q = [dev newCommandQueue];
+      // an unknown selector is answered 0 and logged MISSING (libm2v's forwarding), never an abort
+      long z1 = (long)[(id)dev performSelector:NSSelectorFromString(@"chlNoSuchDeviceMethod")];
+      long z2 = (long)[(id)q performSelector:NSSelectorFromString(@"chlNoSuchQueueMethod")];
+      printf("unknown selectors answered %ld %ld (want 0 0)\n", z1, z2);
       // 1. a blit fill of a shared buffer
       id<MTLBuffer> b = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
       id<MTLCommandBuffer> cb = [q commandBuffer];
