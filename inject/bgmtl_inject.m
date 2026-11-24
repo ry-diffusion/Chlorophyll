@@ -23,6 +23,8 @@
 // relaunches backboardd and bgl-launch starts it on the ES path. 10 s after the first completed command buffer with no failure the
 // launch is marked healthy in bgmtl-bb.state. "crashtest" in bgmtl-bb.arm crashes on purpose 5 s after registration (guard test).
 #import <Foundation/Foundation.h>
+#include <mach-o/getsect.h>
+#include <mach-o/dyld.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -201,6 +203,18 @@ bb_fatal(int sig)
       write(g_exit_fd, m, n);
       void *bt[32];
       backtrace_symbols_fd(bt, backtrace(bt, 32), g_exit_fd);
+      // the reason an abort left for the crash reporter: each image's __DATA,__crash_info annotations (message, message2);
+      // QuartzCore's assertions are named only there (not async-signal-safe, but the process is ending anyway)
+      for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+         unsigned long size = 0;
+         const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+         const uint8_t *ci = mh ? getsectiondata(mh, "__DATA", "__crash_info", &size) : NULL;
+         if (!ci || size < 40) continue;
+         const char *msg = *(const char *const *)(ci + 8), *msg2 = *(const char *const *)(ci + 32);
+         if (msg || msg2) {
+            dprintf(g_exit_fd, "[%d] crash info %s: %.400s | %.400s\n", getpid(), _dyld_get_image_name(i), msg ? msg : "", msg2 ? msg2 : "");
+         }
+      }
    }
    signal(sig, SIG_DFL);
    raise(sig);

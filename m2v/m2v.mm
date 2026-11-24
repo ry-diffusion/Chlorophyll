@@ -135,6 +135,7 @@ extern "C" __attribute__((visibility("default"))) id m2v_create_device(void)
 		}
 		/* plain rows everywhere: no Apple framebuffer compression, no 10-bit deep framebuffer (guacamole) */
 		setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+		setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);   /* the runtime counts its VkPipeline makings (fps meter, telemetry) */
 		CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
