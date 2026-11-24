@@ -64,7 +64,10 @@ static char g_state[192] = F_STATE, g_off[192] = F_OFF;
 // SpringBoard and lived without a Metal device; after a SpringBoard restart the wallpaper stayed the poster's flat placeholder
 // colour while Mercury kept rendering frames nobody composited.
 static const char *const kAllow[] = { "com.apple.MercuryPoster", "com.apple.PhotosUIPrivate.PhotosPosterProvider",
-                                      "com.apple.iconservicesagent", "com.apple.springboard", "com.apple.PosterBoard", NULL };
+                                      "com.apple.iconservicesagent", "com.apple.springboard", "com.apple.PosterBoard",
+                                      // widgets and Control Center controls are drawn here for chronod (2026-11-24: without a device the
+                                      // home-screen widget stayed "Waiting..."); its binary needs the load command (tools/sweetnet/addlc.py)
+                                      "com.apple.chrono.WidgetRenderer-Default", NULL };
 static volatile int g_failures, g_registered, g_bb;
 static volatile unsigned g_completed;
 
