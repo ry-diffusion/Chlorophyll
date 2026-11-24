@@ -1,0 +1,44 @@
+diff --git a/crates/metal2vulkan/src/lower/sampler/bicubic.rs b/crates/metal2vulkan/src/lower/sampler/bicubic.rs
+index 44d330e..a33aa92 100644
+--- a/crates/metal2vulkan/src/lower/sampler/bicubic.rs
++++ b/crates/metal2vulkan/src/lower/sampler/bicubic.rs
+@@ -213,11 +213,27 @@ const SMALL_WORDS: u32 = 256;
+ /// the level's tests and the selects of the fraction and the four taps.
+ const PINNED_WORDS: u32 = 96;
+ 
++/// Chlorophyll: `CHL_M2V_BICUBIC_LINEAR=1` or a list of process names (m2v-env; read once) samples a constexpr bicubic
++/// sampler through the device's linear filter instead of the exact emulation: 16 fetches and ~1,900 words of fixed-point
++/// weights a sample, which made MercuryPoster's frame 457 ms of GPU on the A630 (155 ms with this). Not Metal's texels: a
++/// smooth image looks the same, an enlarged sharp one would show the linear filter's diamonds. The artifact cache does
++/// not key on it: remove the process's `m2v-cache` directory when it changes.
++pub(crate) fn device_linear() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        let me = std::env::current_exe().ok().and_then(|p| Some(p.file_name()?.to_string_lossy().into_owned()));
++        std::env::var("CHL_M2V_BICUBIC_LINEAR").is_ok_and(|v| v == "1" || me.is_some_and(|me| v.split(',').any(|n| n == me)))
++    })
++}
++
+ /// The decoded state of sampler `r` when it is a constexpr sampler with Metal's bicubic filter.
+ pub(super) fn state(r: SamplerRef) -> Result<Option<SamplerState>, Error> {
+     let SamplerRef::Constexpr(words) = r else {
+         return Ok(None);
+     };
++    if device_linear() {
++        return Ok(None);
++    }
+     let s = super::state_of(words)?;
+     Ok((s.min_filter == Filter::Bicubic || s.mag_filter == Filter::Bicubic).then_some(s))
+ }
+diff --git a/crates/metal2vulkan/src/lower/sampler/constexpr.rs b/crates/metal2vulkan/src/lower/sampler/constexpr.rs
+index 8e747b7..65bfa44 100644
+--- a/crates/metal2vulkan/src/lower/sampler/constexpr.rs
++++ b/crates/metal2vulkan/src/lower/sampler/constexpr.rs
+@@ -144,6 +144,7 @@ fn min_mag(f: Filter) -> Result<SamplerMinMagFilter, Error> {
+         Filter::Linear => Ok(SamplerMinMagFilter::Linear),
+         // A sample through a bicubic sampler is emulated by fetches and a gather ignores the
+         // filter: the immutable sampler's filters select nothing, so they are nearest.
++        Filter::Bicubic if super::bicubic::device_linear() => Ok(SamplerMinMagFilter::Linear),
+         Filter::Bicubic => Ok(SamplerMinMagFilter::Nearest),
+     }
+ }
