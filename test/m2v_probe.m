@@ -41,6 +41,68 @@ main(void)
          free(bm); free(mm);
          return 0;
       }
+      // M2V_RGB10A2=1: RenderBox's glass mask case (iconservicesagent): an RGB10A2Unorm render target over a no-copy buffer of plain
+      // memory (rows 256 bytes, Metal's own 240), 60x60. (a) a clear pass: every texel must read back 0xC00003FF (R=1023, A=3);
+      // (b) a load+store pass with no draw: the CPU's pattern must come back unchanged.
+      if (getenv("M2V_RGB10A2")) {
+         const NSUInteger W = 60, H = 60, ROW = 256, LEN = 16384;
+         void *mem = NULL; posix_memalign(&mem, 16384, LEN);
+         id<MTLBuffer> buf = [dev newBufferWithBytesNoCopy:mem length:LEN options:MTLResourceStorageModeShared deallocator:nil];
+         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGB10A2Unorm width:W height:H mipmapped:NO];
+         td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
+         id<MTLTexture> t = [buf newTextureWithDescriptor:td offset:0 bytesPerRow:ROW];
+         printf("rgb10a2: buffer %s, texture %s\n", buf ? "ok" : "refused", t ? "ok" : "refused");
+         if (!t) return 1;
+         for (int step = 0; step < 2; step++) {
+            uint32_t *w = mem;
+            for (NSUInteger k = 0; k < LEN / 4; k++) w[k] = 0x12345678u;
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = t;
+            rp.colorAttachments[0].loadAction = step == 0 ? MTLLoadActionClear : MTLLoadActionLoad;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+            [cb commit]; [cb waitUntilCompleted];
+            const uint32_t want = step == 0 ? 0xC00003FFu : 0x12345678u;
+            unsigned bad = 0, badRows = 0, firstBadRow = 999;
+            for (NSUInteger y = 0; y < H; y++) {
+               unsigned rb = 0;
+               for (NSUInteger x = 0; x < W; x++) if (((uint32_t *)((uint8_t *)mem + y * ROW))[x] != want) { bad++; rb++; }
+               if (rb) { badRows++; if (firstBadRow == 999) firstBadRow = (unsigned)y; }
+            }
+            uint32_t *r0 = mem, *rl = (uint32_t *)((uint8_t *)mem + (H - 1) * ROW);
+            printf("rgb10a2 %s: %u of %lu texels wrong in %u rows (first row %u); row0[0]=%08x row59[0]=%08x row59[59]=%08x want %08x\n",
+                   step == 0 ? "clear" : "load+store", bad, (unsigned long)(W * H), badRows, firstBadRow, r0[0], rl[0], rl[W - 1], want);
+         }
+         // (c) a draw over the top half only (/var/root/half.metallib: half_vs/half_fs, solid green), the pass loading the CPU's
+         // pattern: the top 30 rows must read 0xC00FFC00 (G=1023, A=3), the bottom 30 the pattern
+         NSError *err = nil;
+         id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"/var/root/half.metallib"] error:&err];
+         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+         pd.vertexFunction = [lib newFunctionWithName:@"half_vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"half_fs"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGB10A2Unorm;
+         id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+         if (!ps) { printf("rgb10a2 draw: pipeline refused: %s\n", [[err description] UTF8String]); return 1; }
+         uint32_t *w = mem;
+         for (NSUInteger k = 0; k < LEN / 4; k++) w[k] = 0x12345678u;
+         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+         rp.colorAttachments[0].texture = t; rp.colorAttachments[0].loadAction = MTLLoadActionLoad; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+         id<MTLCommandBuffer> cb = [q commandBuffer];
+         id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+         [re setRenderPipelineState:ps]; [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6]; [re endEncoding];
+         [cb commit]; [cb waitUntilCompleted];
+         unsigned topBad = 0, botBad = 0;
+         for (NSUInteger y = 0; y < H; y++)
+            for (NSUInteger x = 0; x < W; x++) {
+               uint32_t v = ((uint32_t *)((uint8_t *)mem + y * ROW))[x];
+               if (y < H / 2) topBad += v != 0xC00FFC00u; else botBad += v != 0x12345678u;
+            }
+         printf("rgb10a2 half draw: top %u of 1800 wrong, bottom %u of 1800 wrong; row0[0]=%08x row29[0]=%08x row30[0]=%08x row59[0]=%08x\n",
+                topBad, botBad, w[0], ((uint32_t *)((uint8_t *)mem + 29 * ROW))[0], ((uint32_t *)((uint8_t *)mem + 30 * ROW))[0],
+                ((uint32_t *)((uint8_t *)mem + 59 * ROW))[0]);
+         return 0;
+      }
       // an unknown selector is answered 0 and logged MISSING (libm2v's forwarding), never an abort
       long z1 = (long)[(id)dev performSelector:NSSelectorFromString(@"chlNoSuchDeviceMethod")];
       long z2 = (long)[(id)q performSelector:NSSelectorFromString(@"chlNoSuchQueueMethod")];
