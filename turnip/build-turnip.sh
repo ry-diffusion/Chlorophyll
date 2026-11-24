@@ -25,7 +25,7 @@ mkdir -p "$D"
 cd "$D"
 if [ ! -d mesa ]; then
   git clone -q --shared "$MESA" mesa
-  for p in air-frontend ir3-round-default ir3-ssbo-subdword ir3-context-error-return ir3-disk-cache-macho ir3-opt-jump-linear turnip-ios; do
+  for p in air-frontend ir3-round-default ir3-ssbo-subdword ir3-context-error-return ir3-disk-cache-macho ir3-opt-jump-linear turnip-ios turnip-program-state-pointer; do
     git -C mesa apply "$HERE/patches/mesa-26.2/$p.patch"
   done
   mkdir -p mesa/src/compiler/air
