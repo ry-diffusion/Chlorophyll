@@ -41,6 +41,48 @@ main(void)
          free(bm); free(mm);
          return 0;
       }
+      // M2V_SWIZZLE=1: RenderBox's glyph layers (iconservicesagent): an RG8Unorm texture (grey, alpha) read through the swizzle RRRG.
+      // Texels (255, 128) drawn unblended must read back grey in every colour channel with alpha 128: 0x80ffffff (unswizzled:
+      // 0xffff8000, the yellow glyph in an opaque box the home screen's icons had).
+      if (getenv("M2V_SWIZZLE")) {
+         NSError *err = nil;
+         id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"/var/root/bg_render.metallib"] error:&err];
+         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+         pd.vertexFunction = [lib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [lib newFunctionWithName:@"bg_fs_tex"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         id<MTLRenderPipelineState> ps = pd.vertexFunction ? [dev newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+         MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm width:4 height:4 mipmapped:NO];
+         sd.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleGreen);
+         id<MTLTexture> st = [dev newTextureWithDescriptor:sd];
+         uint8_t la[32];
+         for (int k = 0; k < 32; k += 2) { la[k] = 255; la[k + 1] = 128; }
+         [st replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:la bytesPerRow:8];
+         MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:8 height:8 mipmapped:NO];
+         rd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+         id<MTLTexture> rt = [dev newTextureWithDescriptor:rd];
+         static const float quad[48] = {-1, -1, 0, 1, 1, 1, 1, 1, 3, -1, 0, 1, 1, 1, 1, 1, -1, 3, 0, 1, 1, 1, 1, 1};   // one triangle over the target
+         id<MTLBuffer> vb = [dev newBufferWithBytes:quad length:sizeof quad options:MTLResourceStorageModeShared];
+         uint32_t px[64] = {0};
+         if (ps && st && rt) {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = rt; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+            [re setRenderPipelineState:ps];
+            [re setVertexBuffer:vb offset:0 atIndex:0];
+            [re setFragmentTexture:st atIndex:0];
+            [re setFragmentSamplerState:[dev newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]] atIndex:0];
+            [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [re endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            [rt getBytes:px bytesPerRow:32 fromRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0];
+         }
+         MTLTextureSwizzleChannels z = st.swizzle;
+         printf("swizzle: pipeline %d texture %d, its swizzle %u%u%u%u (want 2223), pixel 0x%08x 0x%08x, want 0x80ffffff: %s\n", ps != nil, st != nil, z.red,
+                z.green, z.blue, z.alpha, px[0], px[63], px[0] == 0x80ffffff && px[63] == 0x80ffffff ? "PASS" : "FAIL");
+      }
       // M2V_RGB10A2=1: RenderBox's glass mask case (iconservicesagent): an RGB10A2Unorm render target over a no-copy buffer of plain
       // memory (rows 256 bytes, Metal's own 240), 60x60. (a) a clear pass: every texel must read back 0xC00003FF (R=1023, A=3);
       // (b) a load+store pass with no draw: the CPU's pattern must come back unchanged.
@@ -101,6 +143,57 @@ main(void)
          printf("rgb10a2 half draw: top %u of 1800 wrong, bottom %u of 1800 wrong; row0[0]=%08x row29[0]=%08x row30[0]=%08x row59[0]=%08x\n",
                 topBad, botBad, w[0], ((uint32_t *)((uint8_t *)mem + 29 * ROW))[0], ((uint32_t *)((uint8_t *)mem + 30 * ROW))[0],
                 ((uint32_t *)((uint8_t *)mem + 59 * ROW))[0]);
+         // (d) RenderBox's way of drawing into such a target (iconservicesagent's icon layers): the same top-half quad under a
+         // scissor (10, 6, 30 x 40), then blended, then with RenderBox's other attachments (RG16Float, RGBA16Float, depth and
+         // stencil) beside it. Only x 10..39, y 6..29 may change.
+         for (int variant = 0; variant < 3; variant++) {
+            MTLRenderPipelineDescriptor *sd = [MTLRenderPipelineDescriptor new];
+            sd.vertexFunction = pd.vertexFunction; sd.fragmentFunction = pd.fragmentFunction;
+            sd.colorAttachments[0].pixelFormat = MTLPixelFormatRGB10A2Unorm;
+            if (variant >= 1) {
+               sd.colorAttachments[0].blendingEnabled = YES;
+               sd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne; sd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+               sd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+               sd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            }
+            MTLRenderPassDescriptor *sp = [MTLRenderPassDescriptor renderPassDescriptor];
+            sp.colorAttachments[0].texture = t; sp.colorAttachments[0].loadAction = MTLLoadActionLoad; sp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            if (variant == 2) {
+               const MTLPixelFormat extra[2] = {MTLPixelFormatRG16Float, MTLPixelFormatRGBA16Float};
+               for (int k = 0; k < 2; k++) {
+                  MTLTextureDescriptor *ed = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:extra[k] width:W height:H mipmapped:NO];
+                  ed.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; ed.storageMode = MTLStorageModePrivate;
+                  sp.colorAttachments[k + 1].texture = [dev newTextureWithDescriptor:ed];
+                  sp.colorAttachments[k + 1].loadAction = MTLLoadActionLoad; sp.colorAttachments[k + 1].storeAction = MTLStoreActionStore;
+                  sd.colorAttachments[k + 1].pixelFormat = extra[k]; sd.colorAttachments[k + 1].writeMask = MTLColorWriteMaskNone;
+               }
+               MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8 width:W height:H mipmapped:NO];
+               dd.usage = MTLTextureUsageRenderTarget; dd.storageMode = MTLStorageModePrivate;
+               id<MTLTexture> ds = [dev newTextureWithDescriptor:dd];
+               sp.depthAttachment.texture = ds; sp.stencilAttachment.texture = ds;
+               sp.depthAttachment.loadAction = MTLLoadActionClear; sp.stencilAttachment.loadAction = MTLLoadActionClear;
+               sd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8; sd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+            }
+            id<MTLRenderPipelineState> sps = [dev newRenderPipelineStateWithDescriptor:sd error:&err];
+            if (!sps) { printf("rgb10a2 scissor %d: pipeline refused: %s\n", variant, [[err description] UTF8String]); continue; }
+            for (NSUInteger k = 0; k < LEN / 4; k++) w[k] = 0x12345678u;
+            id<MTLCommandBuffer> scb = [q commandBuffer];
+            id<MTLRenderCommandEncoder> se = [scb renderCommandEncoderWithDescriptor:sp];
+            [se setScissorRect:(MTLScissorRect){10, 6, 30, 40}];
+            [se setRenderPipelineState:sps]; [se drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6]; [se endEncoding];
+            [scb commit]; [scb waitUntilCompleted];
+            unsigned inBad = 0, outBad = 0; NSUInteger x0 = W, x1 = 0, y0 = H, y1 = 0;
+            for (NSUInteger y = 0; y < H; y++)
+               for (NSUInteger x = 0; x < W; x++) {
+                  uint32_t v = ((uint32_t *)((uint8_t *)mem + y * ROW))[x];
+                  const bool inside = x >= 10 && x < 40 && y >= 6 && y < 30;
+                  if (inside) inBad += v != 0xC00FFC00u; else outBad += v != 0x12345678u;
+                  if (v != 0x12345678u) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+               }
+            printf("rgb10a2 scissor%s%s: %u of 720 inside wrong, %u outside wrong; changed x %lu..%lu y %lu..%lu (want 10..39, 6..29), status %ld\n",
+                   variant >= 1 ? " + blend" : "", variant == 2 ? " + RenderBox's attachments" : "", inBad, outBad,
+                   (unsigned long)x0, (unsigned long)x1, (unsigned long)y0, (unsigned long)y1, (long)scb.status);
+         }
          return 0;
       }
       // an unknown selector is answered 0 and logged MISSING (libm2v's forwarding), never an abort

@@ -1,5 +1,5 @@
 diff --git a/userland/metal2/NativeBridgeMetalFrontend.mm b/userland/metal2/NativeBridgeMetalFrontend.mm
-index 96a3488..3e6f92f 100644
+index 96a3488..2e252b6 100644
 --- a/userland/metal2/NativeBridgeMetalFrontend.mm
 +++ b/userland/metal2/NativeBridgeMetalFrontend.mm
 @@ -17,15 +17,19 @@
@@ -22,16 +22,27 @@ index 96a3488..3e6f92f 100644
  #include <execinfo.h>
  #include <mach/mach.h>
  #include "bridge/NativeMetalObjects.h"
-@@ -69,7 +73,7 @@
+@@ -68,8 +72,18 @@
+ // 0242: the per-binding / per-draw diagnostics (0182 big-texture draw trace, 0188 watched surfaces, 0219 YCbCr
  // draws) cost Objective-C allocations, associated-object locks and string formatting on every texture and sampler
  // bind, pipeline change and draw. They now run only while /var/local/mtl2-trace exists (read once per process).
++// Chlorophyll: /private/var/tmp/m2v-trace-only holds a process name: the trace and dump switches then apply to that process alone
++// (the dump switches in SpringBoard slow its start by minutes).
++static bool chlTraceProc() {
++ static const bool mine=[]{
++  char name[64]={};
++  if(FILE *f=fopen("/private/var/tmp/m2v-trace-only","r")){if(fgets(name,sizeof name,f))name[strcspn(name,"\r\n")]=0;fclose(f);}
++  return !name[0] || strcmp(name,getprogname())==0;
++ }();
++ return mine;
++}
  static bool traceOn() {
 - static const bool on=access("/var/local/mtl2-trace",F_OK)==0;
-+ static const bool on=access("/private/var/tmp/m2v-trace",F_OK)==0;   // Chlorophyll: our path
++ static const bool on=chlTraceProc() && access("/private/var/tmp/m2v-trace",F_OK)==0;   // Chlorophyll: our path
   return on;
  }
  static bool watchedSurface(IOSurfaceRef sf) {
-@@ -186,6 +190,52 @@ static void journal(const std::string &line) {
+@@ -186,6 +200,52 @@ static void journal(const std::string &line) {
   if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
  }
  
@@ -49,7 +60,7 @@ index 96a3488..3e6f92f 100644
 +// with tracing (/private/var/tmp/m2v-trace): the first 40 draws of a process, with their pipeline, for CHL_M2V_SKIP's indices
 +static void chlLogDraw(id encoder,uint32_t index,NSUInteger count,NSUInteger instances) {
 + static std::atomic<int> n{0};
-+ if(n.fetch_add(1)>=40)return;
++ if(n.fetch_add(1)>=4000)return;
 + NBLOG(@"chl draw #%u: %lu x %lu: %@",index,(unsigned long)count,(unsigned long)instances,objc_getAssociatedObject(encoder,"pipe")?:@"?");
 +}
 +static bool chlSkip(bool draw,uint32_t index) {
@@ -84,7 +95,7 @@ index 96a3488..3e6f92f 100644
  @interface NBObject : NSObject
  @property(atomic,copy) NSString *label;
  @end
-@@ -193,6 +243,7 @@ @implementation NBObject
+@@ -193,6 +253,7 @@ @implementation NBObject
  - (id<MTLDevice>)device {return gDeviceObject;}
  // Metal SPI (Metal Performance Shaders asks every encoder and command buffer): an identity for its traces.
  - (uint64_t)globalTraceObjectID {return (uint64_t)(uintptr_t)self;}
@@ -92,7 +103,7 @@ index 96a3488..3e6f92f 100644
  - (void)doesNotRecognizeSelector:(SEL)selector {
   if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
   noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
-@@ -223,6 +274,7 @@ @interface NBBuffer : NBObject
+@@ -223,6 +284,7 @@ @interface NBBuffer : NBObject
  @property(nonatomic) MTLResourceOptions options;
  @property(nonatomic,copy) void (^deallocator)(void *,NSUInteger);
  @property(nonatomic) void *wrapped;
@@ -100,7 +111,7 @@ index 96a3488..3e6f92f 100644
  @property(nonatomic) IOSurfaceRef surfaceOwner; // keeps a shared import's CPU mapping alive
  @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
  @property(nonatomic) NSUInteger heapOffset;
-@@ -244,7 +296,7 @@ - (void)dealloc {
+@@ -244,7 +306,7 @@ - (void)dealloc {
   if(_surfaceOwner)CFRelease(_surfaceOwner);
  }
  - (NSUInteger)length {return nmb_buffer_length(_handle);}
@@ -109,7 +120,7 @@ index 96a3488..3e6f92f 100644
  - (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
  - (MTLResourceOptions)resourceOptions {return _options;}
  - (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
-@@ -265,6 +317,187 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
+@@ -265,6 +327,187 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
  // and its retained surface prevent object/address reuse during a hit. A new
  // mapping, allocation identity or size needs a separate import; ordinary
  // caller-owned no-copy buffers do not enter this cache.
@@ -147,7 +158,7 @@ index 96a3488..3e6f92f 100644
 +// Chlorophyll (debugging): /private/var/tmp/m2v-dump (a directory) makes the first 6 command buffers of a process that
 +// render or compute copy each pass's resolve/colour target and each compute-bound texture into shared buffers at commit, written
 +// after completion as <dir>/<pid>-<cb>-<n>-<what>.raw: "M2VD", width, height, pixel format, bytes per row (uint32 each), texels.
-+static bool chlDumpOn() {static const bool on=access("/private/var/tmp/m2v-dump",F_OK)==0;return on;}
++static bool chlDumpOn() {static const bool on=chlTraceProc() && access("/private/var/tmp/m2v-dump",F_OK)==0;return on;}
 +static void chlNoteDump(id cb,id<MTLTexture> t,NSString *what) {
 + if(!cb || !t || t.sampleCount>1 || t.storageMode==MTLStorageModeMemoryless || t.textureType!=MTLTextureType2D)return;
 + NSMutableArray *a=objc_getAssociatedObject(cb,"chlDump");
@@ -169,12 +180,12 @@ index 96a3488..3e6f92f 100644
 +static std::atomic<int> gDumpCommits{0};
 +// Chlorophyll: /private/var/tmp/m2v-dump-passes (with m2v-dump's directory): each render pass's colour target is copied right after the
 +// pass ends, so ping-ponged targets (RenderBox's distance-field iterations) show every step; the first 60 passes of a process.
-+static bool chlDumpPassesOn() {static const bool on=access("/private/var/tmp/m2v-dump-passes",F_OK)==0;return on;}
++static bool chlDumpPassesOn() {static const bool on=chlTraceProc() && access("/private/var/tmp/m2v-dump-passes",F_OK)==0;return on;}
 +static NSUInteger chlTexelBytes(MTLPixelFormat f);
 +static void chlDumpPass(id cb,id<MTLTexture> t) {
 + static std::atomic<int> passes{0};
 + const int n=passes.fetch_add(1);
-+ if(n>=60 || t.sampleCount>1 || t.textureType!=MTLTextureType2D)return;
++ if(n>=600 || t.sampleCount>1 || t.textureType!=MTLTextureType2D)return;
 + const NSUInteger bpp=chlTexelBytes(t.pixelFormat),w=t.width,h=t.height;
 + if(!bpp)return;
 + id<MTLBuffer> b=[[(id<MTLCommandBuffer>)cb device] newBufferWithLength:w*h*bpp options:MTLResourceStorageModeShared];
@@ -186,7 +197,7 @@ index 96a3488..3e6f92f 100644
 + NSString *label=[t.label?:@"" stringByReplacingOccurrencesOfString:@" " withString:@"_"];
 + [(id<MTLCommandBuffer>)cb addCompletedHandler:^(id<MTLCommandBuffer>){
 +  char path[256];
-+  snprintf(path,sizeof path,"/private/var/tmp/m2v-dump/%d-pass%02d-%s.raw",getpid(),n,label.UTF8String);
++  snprintf(path,sizeof path,"/private/var/tmp/m2v-dump/%d-pass%03d-%s.raw",getpid(),n,label.UTF8String);
 +  FILE *f=fopen(path,"wb");
 +  if(!f)return;
 +  const uint32_t head[5]={0x44563244u,(uint32_t)w,(uint32_t)h,(uint32_t)t.pixelFormat,(uint32_t)(w*bpp)};
@@ -297,7 +308,7 @@ index 96a3488..3e6f92f 100644
  static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
  static std::mutex gSurfaceImportLock;
  static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
-@@ -275,7 +508,8 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
+@@ -275,7 +518,8 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
   if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
   NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
   if(buffer)return buffer;
@@ -307,7 +318,7 @@ index 96a3488..3e6f92f 100644
   if(!handle){NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
   buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
   buffer.surfaceOwner=(IOSurfaceRef)CFRetain(surface);
-@@ -302,9 +536,18 @@ static uint64_t sweetNarrow(NSUInteger format) {
+@@ -302,9 +546,26 @@ static uint64_t sweetNarrow(NSUInteger format) {
   if(format==542)return MTLPixelFormatBGRA8Unorm;
   return format>=550 && format<=555?((format&1)?MTLPixelFormatBGRA8Unorm_sRGB:MTLPixelFormatBGRA8Unorm):format;
  }
@@ -318,6 +329,14 @@ index 96a3488..3e6f92f 100644
  static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
   if(!d)return false;
   *out={(uint64_t)d.textureType,sweetNarrow(d.pixelFormat),d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
++ // RenderBox reads a grey and alpha glyph layer (RG8) through RRRG: without it an icon's glyph was yellow in an opaque black box.
++ const MTLTextureSwizzleChannels z=d.swizzle;
++ if(z.red!=MTLTextureSwizzleRed || z.green!=MTLTextureSwizzleGreen || z.blue!=MTLTextureSwizzleBlue || z.alpha!=MTLTextureSwizzleAlpha){
++  if(d.usage&(MTLTextureUsageRenderTarget|MTLTextureUsageShaderWrite)){   // the runtime has no swizzle that writes (Apple's private writeSwizzleEnabled): made unswizzled, as before
++   static std::atomic<int> said{0};
++   if(said.fetch_add(1)<4)NBLOG(@"native-metal: swizzle %u%u%u%u dropped on a written texture (format %lu usage %lu)",z.red,z.green,z.blue,z.alpha,(unsigned long)d.pixelFormat,(unsigned long)d.usage);
++  } else out->swizzle=(uint64_t)z.red|(uint64_t)z.green<<8|(uint64_t)z.blue<<16|(uint64_t)z.alpha<<24;
++ }
 + if(chlMsaa1() && out->samples>1){
 +  if(d.textureType==MTLTextureType2DMultisample)out->type=MTLTextureType2D;
 +  else if(d.textureType==MTLTextureType2DMultisampleArray)out->type=MTLTextureType2DArray;
@@ -326,7 +345,19 @@ index 96a3488..3e6f92f 100644
   return true;
  }
  @implementation NBTexture
-@@ -407,7 +650,10 @@ - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion
+@@ -318,6 +579,11 @@ - (NSUInteger)mipmapLevelCount {return _descriptor.levels;}
+ - (NSUInteger)sampleCount {return _descriptor.samples;}
+ - (NSUInteger)arrayLength {return _descriptor.array_length;}
+ - (MTLTextureUsage)usage {return (MTLTextureUsage)_descriptor.usage;}
++- (MTLTextureSwizzleChannels)swizzle {
++ const uint64_t z=_descriptor.swizzle;
++ return z?MTLTextureSwizzleChannelsMake((MTLTextureSwizzle)(z&255),(MTLTextureSwizzle)(z>>8&255),(MTLTextureSwizzle)(z>>16&255),(MTLTextureSwizzle)(z>>24&255))
++         :MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha);
++}
+ - (MTLResourceOptions)resourceOptions {return (MTLResourceOptions)_descriptor.options;}
+ - (MTLStorageMode)storageMode {return (MTLStorageMode)((_descriptor.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
+ - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
+@@ -407,7 +673,10 @@ - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion
  // backboardd's render thread (tsample, mtl2 run 11), and most are written by the GPU alone.
  static std::unordered_map<uint32_t,uint32_t> gSurfaceSeeds;
  static os_unfair_lock gSurfaceSeedsLock=OS_UNFAIR_LOCK_INIT;
@@ -338,7 +369,7 @@ index 96a3488..3e6f92f 100644
   if(!surfaces.count)return;
   std::vector<std::pair<uintptr_t,size_t>> ranges;
   ranges.reserve(surfaces.count);
-@@ -415,7 +661,7 @@ static void flushSurfaces(NSMutableSet *surfaces) {
+@@ -415,7 +684,7 @@ static void flushSurfaces(NSMutableSet *surfaces) {
   for(NBTexture *texture in surfaces)if(texture.surface) {
    const uint32_t id=IOSurfaceGetID(texture.surface),seed=IOSurfaceGetSeed(texture.surface);
    auto it=gSurfaceSeeds.find(id);
@@ -347,7 +378,7 @@ index 96a3488..3e6f92f 100644
    gSurfaceSeeds[id]=seed;
    ranges.emplace_back(reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(texture.surface)),IOSurfaceGetAllocSize(texture.surface));
   }
-@@ -565,6 +811,10 @@ - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstant
+@@ -565,6 +834,10 @@ - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstant
  - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
  // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
  // runtime does when the function is made.
@@ -358,7 +389,7 @@ index 96a3488..3e6f92f 100644
  - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
   if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
   if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
-@@ -582,7 +832,7 @@ - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
+@@ -582,7 +855,7 @@ - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
  - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
   const uint64_t functionBegan=nowUs();
   NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
@@ -367,7 +398,7 @@ index 96a3488..3e6f92f 100644
   NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
   return (id<MTLFunction>)function;
  }
-@@ -672,11 +922,21 @@ @interface NBCommandBuffer : NBObject {
+@@ -672,11 +945,21 @@ @interface NBCommandBuffer : NBObject {
   EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
   uint64_t createdUs;
   bool drawsToSurface;      // 0243: a render pass of this buffer writes an IOSurface (a CAMetalLayer drawable, say)
@@ -389,7 +420,7 @@ index 96a3488..3e6f92f 100644
  @property(nonatomic) uint64_t committedUs;
  @property(nonatomic) uint32_t commitIndex;
  @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
-@@ -684,6 +944,7 @@ @interface NBCommandBuffer : NBObject {
+@@ -684,6 +967,7 @@ @interface NBCommandBuffer : NBObject {
  @property(nonatomic,strong) NSArray *priorWorkBuffers;
  @property(nonatomic,strong) NSMutableSet *surfaces;
  @property(nonatomic,strong) NSMutableSet *rotatedShadows;   // 0196: landscape stand-ins rendered into (rotatedSurfaceTexture)
@@ -397,7 +428,7 @@ index 96a3488..3e6f92f 100644
  @property(atomic,strong) NSMutableDictionary *userDictionary;
  // Runtime handles retain GPU storage, but only the Objective-C owner retains
  // a no-copy deallocator, its memory owner and texture/heap ancestry.
-@@ -692,10 +953,13 @@ @interface NBCommandBuffer : NBObject {
+@@ -692,10 +976,13 @@ @interface NBCommandBuffer : NBObject {
  @property(nonatomic,strong) dispatch_group_t schedulingHandlers;
  @property(nonatomic) BOOL schedulingDelivered;
  - (void)refuse:(NSString *)what;
@@ -411,7 +442,7 @@ index 96a3488..3e6f92f 100644
   void *_lastOwner[2];   // 0242: the buffer / texture last added to the command buffer's owners (not retained: identity only)
  }
  @property(nonatomic) NmbEncoder *handle;
-@@ -706,8 +970,14 @@ static void waitForResource(id resource) {
+@@ -706,8 +993,14 @@ static void waitForResource(id resource) {
   NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
   for(NBCommandBuffer *commandBuffer in pending) {
    int dependency=-1;
@@ -426,7 +457,7 @@ index 96a3488..3e6f92f 100644
    gResourceChecks++;
    // An unknown result retains the old conservative wait. False means no matching storage
    // (or GPU work already completed), not a fabricated completion for a pending dependency.
-@@ -715,25 +985,152 @@ static void waitForResource(id resource) {
+@@ -715,25 +1008,152 @@ static void waitForResource(id resource) {
   }
   gTimeResourceWait.add(began);
  }
@@ -583,7 +614,7 @@ index 96a3488..3e6f92f 100644
  }
  static void sweetYCbCrRefresh(id<MTLTexture> t);   // 0257b
  - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
-@@ -743,7 +1140,7 @@ - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)
+@@ -743,7 +1163,7 @@ - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)
    if([(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
   }
   if(texture)sweetYCbCrRefresh(texture);   // 0257b
@@ -592,7 +623,7 @@ index 96a3488..3e6f92f 100644
   if(!traceOn())return;
   // 0188: a watched surface, any stage: the encoder, its pipeline (render) and target, where it is bound
   if(texture && watchedSurface([(NBTexture *)texture surface]) && gWatchLogs.fetch_add(1)<80){
-@@ -785,7 +1182,7 @@ - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)
+@@ -785,7 +1205,7 @@ - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)
  }
  - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
   if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
@@ -601,7 +632,7 @@ index 96a3488..3e6f92f 100644
   if(stage==2 && traceOn()){   // 0182 (0242: tracing only)
    NSMutableDictionary *smp=objc_getAssociatedObject(self,"smp");
    if(!smp){smp=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,"smp",smp,OBJC_ASSOCIATION_RETAIN);}
-@@ -794,17 +1191,26 @@ - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint
+@@ -794,17 +1214,26 @@ - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint
   }
  }
  - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
@@ -631,7 +662,7 @@ index 96a3488..3e6f92f 100644
  }
  @end
  
-@@ -844,7 +1250,7 @@ @implementation NBComputeEncoder
+@@ -844,7 +1273,7 @@ @implementation NBComputeEncoder
  - (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
  - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
   if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
@@ -640,7 +671,7 @@ index 96a3488..3e6f92f 100644
   if(traceOn())objc_setAssociatedObject(self,"pipe",objc_getAssociatedObject(state,"desc"),OBJC_ASSOCIATION_RETAIN);   // 0260
  }
  - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:0];}
-@@ -853,18 +1259,19 @@ - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const
+@@ -853,18 +1282,19 @@ - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const
   for(NSUInteger k=0;k<r.length;k++)[self buffer:b[k] offset:o[k] index:r.location+k stage:0];
  }
  - (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:0];}
@@ -663,7 +694,7 @@ index 96a3488..3e6f92f 100644
   if(traceOn()){   // 0260: each distinct kernel + textures once (<= 80 a process)
    static std::mutex lock;static NSMutableSet<NSString *> *seen;
    NSDictionary *ct=objc_getAssociatedObject(self,"ctex");
-@@ -926,7 +1333,7 @@ static void traceBigTextureDraw(id encoder,const char *kind,NSUInteger count,NSU
+@@ -926,7 +1356,7 @@ static void traceBigTextureDraw(id encoder,const char *kind,NSUInteger count,NSU
  @implementation NBRenderEncoder
  - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
   if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
@@ -672,7 +703,7 @@ index 96a3488..3e6f92f 100644
   if(traceOn())objc_setAssociatedObject(self,"pipe",objc_getAssociatedObject(state,"desc"),OBJC_ASSOCIATION_RETAIN);   // 0182 (0242: tracing only)
  }
  - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
-@@ -956,19 +1363,21 @@ - (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained
+@@ -956,19 +1386,21 @@ - (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained
  }
  - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
   if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
@@ -686,7 +717,7 @@ index 96a3488..3e6f92f 100644
 + {[self nbRun:[=,self_=self]()->bool{NmbEncoder *h_=self_.handle;if(!h_)return false;return nmb_render_set_viewport(h_,values);} what:"setViewport"];}
  }
  - (void)setScissorRect:(MTLScissorRect)r {
-+ if(traceOn()){static std::atomic<int> n{0};if(n.fetch_add(1)<60)NBLOG(@"chl scissor %lu %lu %lu x %lu",(unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height);}
++ if(traceOn()){static std::atomic<int> n{0};if(n.fetch_add(1)<4000)NBLOG(@"chl scissor %lu %lu %lu x %lu",(unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height);}
   const uint64_t values[4]={r.x,r.y,r.width,r.height};
 - [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
 + {[self nbRun:[=,self_=self]()->bool{NmbEncoder *h_=self_.handle;if(!h_)return false;return nmb_render_set_scissor(h_,values);} what:"setScissorRect"];}
@@ -698,7 +729,7 @@ index 96a3488..3e6f92f 100644
   _rasterSent=true;
  }
  - (void)setCullMode:(MTLCullMode)m {if(_rasterSent && _cull==(uint64_t)m)return;_cull=m;[self raster];}
-@@ -981,11 +1390,11 @@ - (void)setDepthClipMode:(MTLDepthClipMode)mode {
+@@ -981,11 +1413,11 @@ - (void)setDepthClipMode:(MTLDepthClipMode)mode {
  - (void)setFrontFacingWinding:(MTLWinding)w {if(_rasterSent && _winding==(uint64_t)w)return;_winding=w;[self raster];}
  - (void)setTriangleFillMode:(MTLTriangleFillMode)f {if(_rasterSent && _fill==(uint64_t)f)return;_fill=f;[self raster];}
  - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
@@ -713,7 +744,7 @@ index 96a3488..3e6f92f 100644
  }
  - (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index {
   MTLStoreAction effective=action;
-@@ -996,13 +1405,13 @@ - (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index {
+@@ -996,13 +1428,13 @@ - (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index {
    if(overrideIndex<=3 || overrideIndex%120==0)NBLOG(@"native-metal: late drawable store Unknown overridden to Store #%llu",(unsigned long long)overrideIndex);
   }
   if(logIndex<=3 || logIndex%120==0)NBLOG(@"native-metal: setColorStoreAction index=%lu requested=%lu effective=%lu drawable=%d",(unsigned long)index,(unsigned long)action,(unsigned long)effective,(int)self.drawableTarget);
@@ -730,7 +761,7 @@ index 96a3488..3e6f92f 100644
  }
  - (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
   [self texture:t index:ti stage:2];[self sampler:s index:si stage:2];
-@@ -1015,17 +1424,19 @@ - (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {(void)t;(void)i;
+@@ -1015,17 +1447,19 @@ - (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {(void)t;(void)i;
  - (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
  - (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
  - (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
@@ -754,7 +785,7 @@ index 96a3488..3e6f92f 100644
  }
  - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
   [self drawPrimitives:t vertexStart:s vertexCount:n instanceCount:i baseInstance:0];
-@@ -1038,8 +1449,10 @@ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n index
+@@ -1038,8 +1472,10 @@ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n index
   if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
   [self.commandBuffer.resourceOwners addObject:b];
   gDraws++;self.commandBuffer->encodedWork.draws++;
@@ -766,7 +797,7 @@ index 96a3488..3e6f92f 100644
  }
  - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
                  instanceCount:(NSUInteger)i {
-@@ -1083,11 +1496,11 @@ - (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture slice:(NSUInteger)s
+@@ -1083,11 +1519,11 @@ - (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture slice:(NSUInteger)s
  }
  - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {
   if(![self buffers:NB_OBJECTS(s,d) count:2])return;
@@ -780,7 +811,7 @@ index 96a3488..3e6f92f 100644
  }
  - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
-@@ -1098,7 +1511,7 @@ - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel
+@@ -1098,7 +1534,7 @@ - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel
     [(NBTexture *)d surface]?IOSurfaceGetID([(NBTexture *)d surface]):0,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,
     (unsigned long)so.x,(unsigned long)so.y,(unsigned long)z.width,(unsigned long)z.height);
   const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
@@ -789,7 +820,7 @@ index 96a3488..3e6f92f 100644
  }
  - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
   if(![self textures:NB_OBJECTS(s,d) count:2])return;
-@@ -1109,18 +1522,28 @@ - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
+@@ -1109,18 +1545,28 @@ - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
         destinationLevel:level destinationOrigin:MTLOriginMake(0,0,0)];
   }
  }
@@ -820,7 +851,7 @@ index 96a3488..3e6f92f 100644
  }
  // 0186: the forms with MTLBlitOption (Unity 6 / Angry Birds 2 calls the buffer-to-texture one on its first frame; the
  // missing selector ended in a crash). None is the plain copy. The depth/stencil-aspect options choose which half of a
-@@ -1149,7 +1572,7 @@ - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLe
+@@ -1149,7 +1595,7 @@ - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLe
  }
  - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
   if(![self textures:NB_OBJECTS(t) count:1])return;
@@ -829,7 +860,7 @@ index 96a3488..3e6f92f 100644
  }
  - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
  @end
-@@ -1248,11 +1671,16 @@ - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
+@@ -1248,11 +1694,16 @@ - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
  static void scheduled(void *context);
  @implementation NBCommandBuffer
  - (instancetype)init {
@@ -849,7 +880,7 @@ index 96a3488..3e6f92f 100644
  - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
  - (BOOL)retainedReferences {return YES;}
  // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
-@@ -1264,6 +1692,8 @@ - (void)refuse:(NSString *)what {
+@@ -1264,6 +1715,8 @@ - (void)refuse:(NSString *)what {
  }
  - (MTLCommandBufferStatus)status {
   if(self.failedLocally)return MTLCommandBufferStatusError;
@@ -858,7 +889,7 @@ index 96a3488..3e6f92f 100644
   return (MTLCommandBufferStatus)nmb_command_buffer_status(_handle);
  }
  - (NSError *)error {
-@@ -1289,7 +1719,22 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
+@@ -1289,7 +1742,22 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
   encoder.handle=handle;encoder.commandBuffer=self;return encoder;
  }
  - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
@@ -882,7 +913,7 @@ index 96a3488..3e6f92f 100644
  }
  - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
   if(type!=MTLDispatchTypeSerial){[self refuse:@"concurrent compute dispatch"];return nil;}
-@@ -1297,6 +1742,17 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
+@@ -1297,6 +1765,17 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
  }
  - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
   gBlits++;encodedWork.blits++;
@@ -900,7 +931,7 @@ index 96a3488..3e6f92f 100644
   return [self encoder:[NBBlitEncoder new] handle:self.committed?nullptr:nmb_blit_encoder_new(_handle) what:@"blitCommandEncoder"];
  }
  - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
-@@ -1320,11 +1776,21 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
+@@ -1320,11 +1799,21 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
    NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];drawsToSurface=true;}
    if(NBTexture *shadow=rotationShadowOf(texture))[_rotatedShadows addObject:shadow];   // 0196
    [_resourceOwners addObject:texture];
@@ -922,7 +953,7 @@ index 96a3488..3e6f92f 100644
     if(NBTexture *shadow=rotationShadowOf(resolve))[_rotatedShadows addObject:shadow];
     [_resourceOwners addObject:resolve];
     out.resolve=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
-@@ -1348,14 +1814,39 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
+@@ -1348,14 +1837,52 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
   }
   if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
   pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
@@ -961,10 +992,23 @@ index 96a3488..3e6f92f 100644
 +  id<MTLTexture> t=c.resolveTexture?:c.texture;
 +  if(t)chlNoteDump(self,t,[NSString stringWithFormat:@"pass-c%lu-%@",(unsigned long)i,[t.label?:@"" stringByReplacingOccurrencesOfString:@" " withString:@"_"]]);
 + }
++ if(traceOn()){   // every attachment's size: the pass renders the smallest one's area, and RenderBox sets no viewport
++  static std::atomic<int> n{0};
++  if(n.fetch_add(1)<700){
++   NSMutableString *m=[NSMutableString string];
++   for(NSUInteger i=0;i<8;i++){
++    MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
++    if(c.texture)[m appendFormat:@" c%lu %lux%lu L%lu fmt %lu ld%lu st%lu sm%lu%@%@",(unsigned long)i,(unsigned long)c.texture.width,(unsigned long)c.texture.height,(unsigned long)c.level,(unsigned long)c.texture.pixelFormat,(unsigned long)c.loadAction,(unsigned long)c.storeAction,(unsigned long)c.texture.storageMode,c.texture.buffer?@" over-buffer":@"",c.resolveTexture?@" +resolve":@""];
++   }
++   if(d.depthAttachment.texture)[m appendFormat:@" depth %lux%lu fmt %lu",(unsigned long)d.depthAttachment.texture.width,(unsigned long)d.depthAttachment.texture.height,(unsigned long)d.depthAttachment.texture.pixelFormat];
++   if(d.stencilAttachment.texture)[m appendFormat:@" stencil %lux%lu fmt %lu",(unsigned long)d.stencilAttachment.texture.width,(unsigned long)d.stencilAttachment.texture.height,(unsigned long)d.stencilAttachment.texture.pixelFormat];
++   NBLOG(@"chl pass:%@ target %lux%lu samples %lu",m,(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight,(unsigned long)d.defaultRasterSampleCount);
++  }
++ }
   if(traceOn() && [encoder isKindOfClass:[NBRenderEncoder class]]){   // 0182: the pass's colour target, for the draw trace (0242: tracing only)
    id<MTLTexture> t0=d.colorAttachments[0].texture;IOSurfaceRef sf=[(id)t0 isKindOfClass:[NBTexture class]]?[(NBTexture *)t0 surface]:nullptr;
    objc_setAssociatedObject(encoder,"target",[NSString stringWithFormat:@"%lux%lu fmt %lu surf %#x load %lu label %@",(unsigned long)t0.width,(unsigned long)t0.height,
-@@ -1383,6 +1874,7 @@ - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
+@@ -1383,6 +1910,7 @@ - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
   if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
   if(self.committed){[self refuse:@"event encoded after commit"];return;}
   NmbEvent *handle=[(NBEvent *)event handle];
@@ -972,7 +1016,7 @@ index 96a3488..3e6f92f 100644
   if(!(signal?nmb_command_buffer_signal_event(_handle,handle,value):nmb_command_buffer_wait_event(_handle,handle,value)))
    [self refuse:[NSString stringWithFormat:@"%s: %@",signal?"encodeSignalEvent":"encodeWaitForEvent",lastError()]];
  }
-@@ -1409,7 +1901,26 @@ - (void)didSchedule {
+@@ -1409,7 +1937,26 @@ - (void)didSchedule {
  }
  // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
  - (void)finish {
@@ -1000,7 +1044,7 @@ index 96a3488..3e6f92f 100644
   NSArray<id<MTLDrawable>> *drawables;
   @synchronized(self){drawables=[_presentDrawables copy];[_presentDrawables removeAllObjects];}
   const MTLCommandBufferStatus status=self.status;
-@@ -1484,7 +1995,7 @@ - (void)finish {
+@@ -1484,7 +2031,7 @@ - (void)finish {
   }
   // Actual GPU completion (or a local refusal that never submitted) is the
   // release point. A retained completed command must not pin every old frame.
@@ -1009,7 +1053,7 @@ index 96a3488..3e6f92f 100644
   @synchronized(gInFlight){[gInFlight removeObject:self];}
   NSArray *completedHandlers;
   @synchronized(self){
-@@ -1499,8 +2010,30 @@ - (void)finish {
+@@ -1499,8 +2046,30 @@ - (void)finish {
   dispatch_queue_t queue=_queue.completionQueue;
   if(queue)dispatch_async(queue,run);else run();
  }
@@ -1040,7 +1084,7 @@ index 96a3488..3e6f92f 100644
   if(_rotatedShadows.count && !self.encodeFailure){   // 0196: what CA drew in landscape, into the portrait surface
    NSArray *shadows=[_rotatedShadows allObjects];[_rotatedShadows removeAllObjects];
    for(NBTexture *shadow in shadows){
-@@ -1532,6 +2065,7 @@ - (void)commit {
+@@ -1532,6 +2101,7 @@ - (void)commit {
     const uint32_t index=(uint32_t)(gCommits.fetch_add(1)+1);self.commitIndex=index;
     CommitRecord &r=gCommitRing[index%32];
     r={};r.index=index;r.committedUs=self.committedUs;r.ageUs=self.committedUs-createdUs;r.work=encodedWork;
@@ -1048,7 +1092,7 @@ index 96a3488..3e6f92f 100644
     if(encodedWork.passes || encodedWork.draws || encodedWork.dispatches || encodedWork.blits){
      const uint64_t workIndex=++gWorkCommits;
      if(workIndex<=3 || workIndex%30==0){
-@@ -1550,10 +2084,91 @@ - (void)commit {
+@@ -1550,10 +2120,91 @@ - (void)commit {
    }
    [gInFlight addObject:self];
   }
@@ -1141,7 +1185,7 @@ index 96a3488..3e6f92f 100644
    const bool callbacks=nmb_command_buffer_on_completed(_handle,completed,context) &&
                         nmb_command_buffer_on_scheduled(_handle,scheduled,context);
    if(callbacks){
-@@ -1578,6 +2193,7 @@ - (void)commit {
+@@ -1578,6 +2229,7 @@ - (void)commit {
  - (void)waitUntilCompleted {
   if(!self.committed)return;
   const uint64_t began=nowUs();
@@ -1149,7 +1193,7 @@ index 96a3488..3e6f92f 100644
   if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
   dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
   gTimeWaitCompleted.add(began);
-@@ -1585,6 +2201,11 @@ - (void)waitUntilCompleted {
+@@ -1585,6 +2237,11 @@ - (void)waitUntilCompleted {
  - (void)waitUntilScheduled {
   if(!self.committed)return;
   const uint64_t began=nowUs();
@@ -1161,7 +1205,7 @@ index 96a3488..3e6f92f 100644
   if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
    NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
   }
-@@ -1598,7 +2219,9 @@ - (void)waitUntilScheduled {
+@@ -1598,7 +2255,9 @@ - (void)waitUntilScheduled {
    * (the GPU only, not the completed handlers, which may need this very thread). Not in backboardd, whose own
    * frames are shown through the kernel's swap, which already waits for the GPU.
    */
@@ -1172,7 +1216,7 @@ index 96a3488..3e6f92f 100644
   if(drawsToSurface && !windowServer && !self.failedLocally){
    nmb_command_buffer_wait(_handle,0);
    static std::atomic<uint64_t> waits{0};const uint64_t w=++waits;
-@@ -1636,6 +2259,8 @@ - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submissio
+@@ -1636,6 +2295,8 @@ - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submissio
  // GPU priorities are not applied (one hardware queue): reported as not applied.
  - (BOOL)setGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
  - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
@@ -1181,7 +1225,7 @@ index 96a3488..3e6f92f 100644
  - (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {(void)d;return [self commandBuffer];}
  @end
  
-@@ -1724,12 +2349,27 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+@@ -1724,12 +2385,27 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
    if(error)*error=nbError(@"foreign function");return false;
   }
   p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
@@ -1210,7 +1254,7 @@ index 96a3488..3e6f92f 100644
   p->topology=d.inputPrimitiveTopology;p->rasterization=d.rasterizationEnabled;
   if(MTLVertexDescriptor *v=d.vertexDescriptor) {
    for(unsigned i=0;i<31;i++) {
-@@ -1868,7 +2508,9 @@ - (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {
+@@ -1868,7 +2544,9 @@ - (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {
  
  static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &archives,NSError **error) {
   for(id archive in list) {
@@ -1221,7 +1265,7 @@ index 96a3488..3e6f92f 100644
    archives.push_back([(NBBinaryArchive *)archive handle]);
   }
   return true;
-@@ -2118,6 +2760,18 @@ - (MTLSize)maxThreadsPerThreadgroup {
+@@ -2118,6 +2796,18 @@ - (MTLSize)maxThreadsPerThreadgroup {
   uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))NBLOG(@"native-metal: maxThreadsPerThreadgroup: %@",lastError());
   return MTLSizeMake(s[0],s[1],s[2]);
  }
@@ -1240,7 +1284,7 @@ index 96a3488..3e6f92f 100644
  - (void)doesNotRecognizeSelector:(SEL)selector {
   if(gMissing)gMissing("NativeBridgeMetalDevice",sel_getName(selector));
   noteProblem([NSString stringWithFormat:@"missing device %s",sel_getName(selector)]);
-@@ -2158,6 +2812,27 @@ - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources c
+@@ -2158,6 +2848,27 @@ - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources c
  // gets the pitch its length implies where the required one does not fit.
  - (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {
   const size_t page=(size_t)getpagesize();
@@ -1268,7 +1312,7 @@ index 96a3488..3e6f92f 100644
   if(!bytes || !d || !length || ((uintptr_t)bytes&(page-1)) || d.textureType!=MTLTextureType2D || d.mipmapLevelCount>1 || d.arrayLength>1 || d.sampleCount>1){
    NBLOG(@"native-metal: newTextureWithBytesNoCopy refused (%p %lu type %lu levels %lu)",bytes,(unsigned long)length,(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount);
    return nil;
-@@ -2210,9 +2885,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
+@@ -2210,9 +2921,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
  }
  - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
   NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,pointer,length,options);
@@ -1290,7 +1334,7 @@ index 96a3488..3e6f92f 100644
   return (id<MTLBuffer>)buffer;
  }
  - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
-@@ -2442,30 +3129,62 @@ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)opt
+@@ -2442,30 +3165,62 @@ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)opt
  - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
                                                           reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
   if(reflection)*reflection=nil;
@@ -1357,7 +1401,7 @@ index 96a3488..3e6f92f 100644
  - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
   return [(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error];
  }
-@@ -2481,6 +3200,11 @@ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)opt
+@@ -2481,15 +3236,24 @@ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)opt
   NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
   journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
   if(!handle){NBLOG(@"native-metal: render pipeline refused (vertex %@, fragment %@): %@",d.vertexFunction.name,d.fragmentFunction.name,lastError());
@@ -1369,7 +1413,22 @@ index 96a3488..3e6f92f 100644
    return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);}
   NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
   {// 0182: what the pipeline is, for the draw trace of full-screen surface textures
-@@ -2598,6 +3322,7 @@ static void waitGPUForTexture(id<MTLTexture> texture) {
+   MTLRenderPipelineColorAttachmentDescriptor *c=d.colorAttachments[0];
+-  objc_setAssociatedObject(state,"desc",[NSString stringWithFormat:@"label=%@ vf=%@ ff=%@ fmt=%lu blend=%d rgb=%lu:%lu:%lu a=%lu:%lu:%lu mask=%lu samples=%lu",
++  auto constants=[](id<MTLFunction> f)->NSString * {
++   if(![(id)f isKindOfClass:[NBFunction class]])return @"?";
++   const std::string text=((NBFunction *)f).constantsText;return [NSString stringWithUTF8String:text.c_str()]?:@"";
++  };
++  objc_setAssociatedObject(state,"desc",[NSString stringWithFormat:@"label=%@ vf=%@ ff=%@ fmt=%lu blend=%d rgb=%lu:%lu:%lu a=%lu:%lu:%lu mask=%lu samples=%lu vk=[%@] fk=[%@]",
+    d.label?:@"",d.vertexFunction.name?:@"-",d.fragmentFunction.name?:@"-",(unsigned long)c.pixelFormat,(int)c.blendingEnabled,
+    (unsigned long)c.sourceRGBBlendFactor,(unsigned long)c.destinationRGBBlendFactor,(unsigned long)c.rgbBlendOperation,
+    (unsigned long)c.sourceAlphaBlendFactor,(unsigned long)c.destinationAlphaBlendFactor,(unsigned long)c.alphaBlendOperation,
+-   (unsigned long)c.writeMask,(unsigned long)d.rasterSampleCount],OBJC_ASSOCIATION_RETAIN);
++   (unsigned long)c.writeMask,(unsigned long)d.rasterSampleCount,constants(d.vertexFunction),constants(d.fragmentFunction)],OBJC_ASSOCIATION_RETAIN);
+  }
+  return (id<MTLRenderPipelineState>)state;
+ }
+@@ -2598,6 +3362,7 @@ static void waitGPUForTexture(id<MTLTexture> texture) {
   NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
   for(NBCommandBuffer *commandBuffer in pending){
    if(commandBuffer.failedLocally || !commandBuffer.handle)continue;
@@ -1377,7 +1436,7 @@ index 96a3488..3e6f92f 100644
    if(nmb_command_buffer_uses_texture(commandBuffer.handle,[(NBTexture *)texture handle])!=0){
     nmb_command_buffer_wait(commandBuffer.handle,0);
     static std::atomic<uint64_t> waits{0};const uint64_t w=++waits;
-@@ -2646,6 +3371,48 @@ static void hookDrawables() {
+@@ -2646,6 +3411,48 @@ static void hookDrawables() {
   if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
   if(strcmp(getprogname(),"backboardd")!=0)hookDrawables();   // 0244
   if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
@@ -1427,7 +1486,7 @@ index 96a3488..3e6f92f 100644
   // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
   {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
 diff --git a/userland/metal2/bridge/NativeMetalObjects.h b/userland/metal2/bridge/NativeMetalObjects.h
-index cc22052..a7939c5 100644
+index cc22052..d4d97a1 100644
 --- a/userland/metal2/bridge/NativeMetalObjects.h
 +++ b/userland/metal2/bridge/NativeMetalObjects.h
 @@ -64,6 +64,9 @@ bool nmb_binary_archive_serialize(NmbBinaryArchive *, const char *path);
@@ -1440,7 +1499,15 @@ index cc22052..a7939c5 100644
  void nmb_buffer_release(NmbBuffer *);
  void *nmb_buffer_contents(const NmbBuffer *);
  uint64_t nmb_buffer_length(const NmbBuffer *);
-@@ -131,6 +134,9 @@ struct NmbRenderPipelineDescriptor {
+@@ -71,6 +74,7 @@ uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
+ 
+ struct NmbTextureDescriptor {
+     uint64_t type, format, width, height, depth, levels, samples, array_length, usage, options;
++    uint64_t swizzle;   /* MTLTextureSwizzleChannels' four bytes, red lowest; 0: the default */
+ };
+ /* Heaps: type 0 automatic / 1 placement; offset UINT64_MAX asks an automatic heap to place the resource. */
+ NmbHeap *nmb_heap_new(NmbDevice *, uint64_t type, uint64_t size, uint64_t options);
+@@ -131,6 +135,9 @@ struct NmbRenderPipelineDescriptor {
      uint64_t vertex_inputs; /* 0: no vertex descriptor */
      struct NmbVertexAttribute attributes[31];
      struct NmbVertexLayout layouts[31];
@@ -1451,10 +1518,56 @@ index cc22052..a7939c5 100644
  NmbRenderPipeline *nmb_render_pipeline_new(NmbDevice *, const struct NmbRenderPipelineDescriptor *);
  /* Descriptor binaryArchives and MTLPipelineOption bits. NULL options means defaults.
 diff --git a/userland/metal2/bridge/NativeMetalObjects.rs b/userland/metal2/bridge/NativeMetalObjects.rs
-index d9d23cd..ea3929f 100644
+index d9d23cd..e61493f 100644
 --- a/userland/metal2/bridge/NativeMetalObjects.rs
 +++ b/userland/metal2/bridge/NativeMetalObjects.rs
-@@ -1096,6 +1096,21 @@ pub struct NmbRenderPipelineDescriptor {
+@@ -9,8 +9,8 @@ use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
+ use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
+ use metal2vulkan::metal::{
+     BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
+-    PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
+-    TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
++    PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureSwizzle,
++    TextureSwizzleChannels, TextureType, TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
+ };
+ use metal2vulkan::pipeline::{
+     ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
+@@ -684,6 +684,8 @@ pub struct NmbTextureDescriptor {
+     pub array_length: u64,
+     pub usage: u64,
+     pub options: u64,
++    /// `swizzle`: Metal's four raw bytes, red lowest; 0: the default.
++    pub swizzle: u64,
+ }
+ 
+ pub struct NmbTexture(Texture);
+@@ -701,6 +703,10 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
+     out.array_length = d.array_length;
+     out.usage = raw::<TextureUsage>(d.usage, "texture usage")?;
+     out.resource_options = options(d.options)?;
++    if d.swizzle != 0 {
++        let c = |i: u32| raw::<TextureSwizzle>((d.swizzle >> (8 * i)) & 0xff, "texture swizzle");
++        out.swizzle = TextureSwizzleChannels::new(c(0)?, c(1)?, c(2)?, c(3)?);
++    }
+     Ok(out)
+ }
+ 
+@@ -810,6 +816,14 @@ pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut Nmb
+             array_length: t.array_length(),
+             usage: t.usage().as_raw() as u64,
+             options: t.resource_options().raw(),
++            swizzle: {
++                let s = t.swizzle();
++                if s == TextureSwizzleChannels::DEFAULT {
++                    0
++                } else {
++                    [s.red, s.green, s.blue, s.alpha].iter().enumerate().fold(0, |w, (i, c)| w | (c.as_raw() as u64) << (8 * i))
++                }
++            },
+         };
+         Ok(())
+     })
+@@ -1096,6 +1110,21 @@ pub struct NmbRenderPipelineDescriptor {
      pub vertex_inputs: u64,
      pub attributes: [NmbVertexAttribute; 31],
      pub layouts: [NmbVertexLayout; 31],
@@ -1476,7 +1589,7 @@ index d9d23cd..ea3929f 100644
  }
  
  fn optional_format(value: u64) -> Result<Option<PixelFormat>, String> {
-@@ -1149,9 +1164,17 @@ pub unsafe extern "C" fn nmb_render_pipeline_new_with_options(device: *mut NmbDe
+@@ -1149,9 +1178,17 @@ pub unsafe extern "C" fn nmb_render_pipeline_new_with_options(device: *mut NmbDe
  
  fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<RenderPipelineDescriptor, String> {
          let d = get(descriptor)?;
@@ -1496,7 +1609,7 @@ index d9d23cd..ea3929f 100644
          }
          for (slot, c) in out.color_attachments.iter_mut().zip(d.colors.iter()) {
              if c.format == 0 {
-@@ -2105,3 +2128,53 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
+@@ -2105,3 +2142,53 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
          Ok(true)
      })
  }
