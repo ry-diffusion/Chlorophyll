@@ -1,7 +1,16 @@
 diff --git a/userland/metal2/NativeBridgeMetalFrontend.mm b/userland/metal2/NativeBridgeMetalFrontend.mm
-index 96a3488..003bcbd 100644
+index 96a3488..23d55d2 100644
 --- a/userland/metal2/NativeBridgeMetalFrontend.mm
 +++ b/userland/metal2/NativeBridgeMetalFrontend.mm
+@@ -69,7 +69,7 @@
+ // draws) cost Objective-C allocations, associated-object locks and string formatting on every texture and sampler
+ // bind, pipeline change and draw. They now run only while /var/local/mtl2-trace exists (read once per process).
+ static bool traceOn() {
+- static const bool on=access("/var/local/mtl2-trace",F_OK)==0;
++ static const bool on=access("/private/var/tmp/m2v-trace",F_OK)==0;   // Chlorophyll: our path
+  return on;
+ }
+ static bool watchedSurface(IOSurfaceRef sf) {
 @@ -223,6 +223,7 @@ @interface NBBuffer : NBObject
  @property(nonatomic) MTLResourceOptions options;
  @property(nonatomic,copy) void (^deallocator)(void *,NSUInteger);
@@ -19,7 +28,7 @@ index 96a3488..003bcbd 100644
  - (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
  - (MTLResourceOptions)resourceOptions {return _options;}
  - (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
-@@ -265,6 +266,44 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
+@@ -265,6 +266,111 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
  // and its retained surface prevent object/address reuse during a hit. A new
  // mapping, allocation identity or size needs a separate import; ordinary
  // caller-owned no-copy buffers do not enter this cache.
@@ -54,6 +63,73 @@ index 96a3488..003bcbd 100644
 + return fd;
 +}
 +static void chlSurfaceRelease(void *ctx) {CFRelease((IOSurfaceRef)ctx);}
++// Chlorophyll (debugging): /private/var/tmp/m2v-dump (a directory) makes the first 6 command buffers of a process that
++// render or compute copy each pass's resolve/colour target and each compute-bound texture into shared buffers at commit, written
++// after completion as <dir>/<pid>-<cb>-<n>-<what>.raw: "M2VD", width, height, pixel format, bytes per row (uint32 each), texels.
++static bool chlDumpOn() {static const bool on=access("/private/var/tmp/m2v-dump",F_OK)==0;return on;}
++static void chlNoteDump(id cb,id<MTLTexture> t,NSString *what) {
++ if(!cb || !t || t.sampleCount>1 || t.storageMode==MTLStorageModeMemoryless || t.textureType!=MTLTextureType2D)return;
++ NSMutableArray *a=objc_getAssociatedObject(cb,"chlDump");
++ if(!a){a=[NSMutableArray array];objc_setAssociatedObject(cb,"chlDump",a,OBJC_ASSOCIATION_RETAIN);}
++ for(NSArray *e in a)if(e[0]==t)return;
++ if(a.count<32)[a addObject:@[t,what]];
++}
++static NSUInteger chlTexelBytes(MTLPixelFormat f) {
++ switch(f){
++  case MTLPixelFormatR8Unorm:case MTLPixelFormatA8Unorm:return 1;
++  case MTLPixelFormatRG8Unorm:case MTLPixelFormatR16Float:return 2;
++  case MTLPixelFormatBGRA8Unorm:case MTLPixelFormatBGRA8Unorm_sRGB:case MTLPixelFormatRGBA8Unorm:case MTLPixelFormatRGBA8Unorm_sRGB:
++  case MTLPixelFormatRGB10A2Unorm:case MTLPixelFormatBGR10A2Unorm:case MTLPixelFormatRG16Float:case MTLPixelFormatR32Float:return 4;
++  case MTLPixelFormatRGBA16Float:case MTLPixelFormatRG32Float:return 8;
++  case MTLPixelFormatRGBA32Float:return 16;
++  default:return 0;
++ }
++}
++static std::atomic<int> gDumpCommits{0};
++static void chlEncodeDumps(id<MTLCommandBuffer> cb) {
++ NSArray *dumps=objc_getAssociatedObject(cb,"chlDump");
++ if(!dumps.count)return;
++ const int n=gDumpCommits.fetch_add(1);
++ if(n>=6)return;
++ id<MTLBlitCommandEncoder> bl=[cb blitCommandEncoder];
++ NSMutableArray *outs=[NSMutableArray array];
++ for(NSArray *e in dumps){
++  id<MTLTexture> t=e[0];
++  const NSUInteger bpp=chlTexelBytes(t.pixelFormat),w=t.width,h=t.height;
++  if(!bpp){NBLOG(@"chl dump: cb %d %@ %lux%lu fmt %lu skipped (format)",n,e[1],(unsigned long)w,(unsigned long)h,(unsigned long)t.pixelFormat);continue;}
++  id<MTLBuffer> b=[cb.device newBufferWithLength:w*h*bpp options:MTLResourceStorageModeShared];
++  if(!b)continue;
++  [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(w,h,1) toBuffer:b destinationOffset:0
++       destinationBytesPerRow:w*bpp destinationBytesPerImage:w*h*bpp];
++  [outs addObject:@[b,t,e[1]]];
++ }
++ [bl endEncoding];
++ [cb addCompletedHandler:^(id<MTLCommandBuffer> done){
++  (void)done;
++  unsigned i=0;
++  for(NSArray *o in outs){
++   id<MTLBuffer> b=o[0];id<MTLTexture> t=o[1];
++   char path[256];
++   snprintf(path,sizeof path,"/private/var/tmp/m2v-dump/%d-%d-%u-%s.raw",getpid(),n,i++,[o[2] UTF8String]);
++   FILE *f=fopen(path,"wb");
++   if(!f){NBLOG(@"chl dump: cannot write %s",path);continue;}
++   const uint32_t head[5]={0x44563244u,(uint32_t)t.width,(uint32_t)t.height,(uint32_t)t.pixelFormat,(uint32_t)(t.width*chlTexelBytes(t.pixelFormat))};
++   fwrite(head,sizeof head,1,f);fwrite(b.contents,1,b.length,f);fclose(f);
++   // the IOSurface's own bytes beside the GPU's copy (centre texel): equal unless the texture is a shadow never written back
++   IOSurfaceRef sf=[(id)t isKindOfClass:[NBTexture class]]?[(NBTexture *)t surface]:nullptr;
++   if(sf){
++    const NSUInteger bpp=chlTexelBytes(t.pixelFormat),x=t.width/2,y=t.height/2;
++    IOSurfaceLock(sf,kIOSurfaceLockReadOnly,nullptr);
++    const uint8_t *sp=(const uint8_t *)IOSurfaceGetBaseAddress(sf)+[(NBTexture *)t offset]+y*IOSurfaceGetBytesPerRow(sf)+x*bpp;
++    const uint8_t *gp=(const uint8_t *)b.contents+(y*t.width+x)*bpp;
++    NBLOG(@"chl dump: %s: IOSurface %#x (%zu bytes a row) centre %02x%02x%02x%02x, GPU copy %02x%02x%02x%02x",path,IOSurfaceGetID(sf),
++          IOSurfaceGetBytesPerRow(sf),sp[0],sp[1],sp[2],sp[3],gp[0],gp[1],gp[2],gp[3]);
++    IOSurfaceUnlock(sf,kIOSurfaceLockReadOnly,nullptr);
++   }
++  }
++  NBLOG(@"chl dump: cb %d wrote %u textures",n,i);
++ }];
++}
 +static NSHashTable<NBBuffer *> *gShadows;
 +static std::mutex gShadowLock;
 +static void chlRefreshShadows() {
@@ -64,7 +140,7 @@ index 96a3488..003bcbd 100644
  static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
  static std::mutex gSurfaceImportLock;
  static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
-@@ -275,7 +314,8 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
+@@ -275,7 +381,8 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
   if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
   NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
   if(buffer)return buffer;
@@ -74,7 +150,16 @@ index 96a3488..003bcbd 100644
   if(!handle){NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
   buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
   buffer.surfaceOwner=(IOSurfaceRef)CFRetain(surface);
-@@ -1109,6 +1149,16 @@ - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
+@@ -853,7 +960,7 @@ - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const
+  for(NSUInteger k=0;k<r.length;k++)[self buffer:b[k] offset:o[k] index:r.location+k stage:0];
+ }
+ - (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:0];}
+-- (void)setTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:0];}
++- (void)setTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {if(chlDumpOn())chlNoteDump(objc_getAssociatedObject(self,"chlCB"),t,[NSString stringWithFormat:@"cs-t%lu-%@",(unsigned long)i,[t.label?:@"" stringByReplacingOccurrencesOfString:@" " withString:@"_"]]);[self texture:t index:i stage:0];}
+ - (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
+  for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:0];
+ }
+@@ -1109,6 +1216,16 @@ - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
         destinationLevel:level destinationOrigin:MTLOriginMake(0,0,0)];
   }
  }
@@ -91,15 +176,39 @@ index 96a3488..003bcbd 100644
  - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
              sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
       destinationOrigin:(MTLOrigin)dO {
-@@ -1501,6 +1551,7 @@ - (void)finish {
+@@ -1289,7 +1406,9 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
+  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
+ }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
+- return [self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
++ id encoder=[self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
++ if(chlDumpOn() && encoder)objc_setAssociatedObject(encoder,"chlCB",self,OBJC_ASSOCIATION_ASSIGN);
++ return encoder;
+ }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
+  if(type!=MTLDispatchTypeSerial){[self refuse:@"concurrent compute dispatch"];return nil;}
+@@ -1356,6 +1475,11 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
+  }
+  id encoder=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+  if([encoder isKindOfClass:[NBRenderEncoder class]])((NBRenderEncoder *)encoder).drawableTarget=drawableTarget;
++ if(chlDumpOn())for(NSUInteger i=0;i<8;i++){
++  MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
++  id<MTLTexture> t=c.resolveTexture?:c.texture;
++  if(t)chlNoteDump(self,t,[NSString stringWithFormat:@"pass-c%lu-%@",(unsigned long)i,[t.label?:@"" stringByReplacingOccurrencesOfString:@" " withString:@"_"]]);
++ }
+  if(traceOn() && [encoder isKindOfClass:[NBRenderEncoder class]]){   // 0182: the pass's colour target, for the draw trace (0242: tracing only)
+   id<MTLTexture> t0=d.colorAttachments[0].texture;IOSurfaceRef sf=[(id)t0 isKindOfClass:[NBTexture class]]?[(NBTexture *)t0 surface]:nullptr;
+   objc_setAssociatedObject(encoder,"target",[NSString stringWithFormat:@"%lux%lu fmt %lu surf %#x load %lu label %@",(unsigned long)t0.width,(unsigned long)t0.height,
+@@ -1501,6 +1625,8 @@ - (void)finish {
  }
  - (void)commit {
   if(self.committed){NBLOG(@"native-metal: commit twice");return;}
 + chlRefreshShadows();
++ if(chlDumpOn())chlEncodeDumps((id<MTLCommandBuffer>)self);
   if(_rotatedShadows.count && !self.encodeFailure){   // 0196: what CA drew in landscape, into the portrait surface
    NSArray *shadows=[_rotatedShadows allObjects];[_rotatedShadows removeAllObjects];
    for(NBTexture *shadow in shadows){
-@@ -2210,9 +2261,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
+@@ -2210,9 +2336,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
  }
  - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
   NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,pointer,length,options);
