@@ -357,7 +357,42 @@ bb_init(void)
    CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
    CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
    CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-   id dev = bgmtl_create_device();
+   // /private/var/tmp/bgmtl-bb.m2v: backboardd on metal2vulkan (libm2v.dylib, m2v/). The first-frame watchdog never arms for it
+   // (it counts Chlorophyll's commits), so it has a dead-man of its own: two launches in a row that did not stay up 90 s write
+   // bgmtl-bb.off (a backboardd crash loop ends in an initproc panic).
+   id dev = nil;
+   int m2v = exists("/private/var/tmp/bgmtl-bb.m2v");
+   if (m2v) {
+      int unclean = 0, alive = 1;
+      char boot[64] = "";
+      FILE *sf = fopen("/private/var/tmp/bgmtl-bb.m2v.state", "r");
+      if (sf) { if (fscanf(sf, "unclean=%d alive=%d boot=%63s", &unclean, &alive, boot) < 2) { unclean = 0; alive = 1; } fclose(sf); }
+      if (!alive && strcmp(boot, boot_id()) != 0) alive = 1;
+      if (!alive) unclean++;
+      if (unclean >= 2) {
+         FILE *o = fopen(F_BB_OFF, "w");
+         if (o) { fprintf(o, "two unclean metal2vulkan launches\n"); fclose(o); }
+         ilog("backboardd: DEAD-MAN: two metal2vulkan launches did not stay up: %s written, stock", F_BB_OFF);
+         return;
+      }
+      sf = fopen("/private/var/tmp/bgmtl-bb.m2v.state", "w");
+      if (sf) { fprintf(sf, "unclean=%d alive=0 boot=%s\n", unclean, boot_id()); fclose(sf); }
+      void *h = dlopen("/usr/local/lib/bgmtl/libm2v.dylib", RTLD_NOW);
+      id (*create)(void) = h ? (id(*)(void))dlsym(h, "m2v_create_device") : NULL;
+      dev = create ? create() : nil;
+      ilog("backboardd: metal2vulkan device %s%s", dev ? "made" : "refused: ", dev ? "" : (h ? "see m2v.log" : dlerror()));
+      if (!dev) {
+         sf = fopen("/private/var/tmp/bgmtl-bb.m2v.state", "w");
+         if (sf) { fprintf(sf, "unclean=%d alive=1 boot=%s\n", unclean, boot_id()); fclose(sf); }
+         return;
+      }
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 90 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+         FILE *w = fopen("/private/var/tmp/bgmtl-bb.m2v.state", "w");
+         if (w) { fprintf(w, "unclean=0 alive=1 boot=%s\n", boot_id()); fclose(w); }
+         ilog("backboardd: up 90 s on metal2vulkan: dead-man counter reset");
+      });
+   } else
+      dev = bgmtl_create_device();
    if (!dev) { ilog("backboardd: no device could be made: stock"); return; }
    void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
    NSArray *(*all)(void) = (NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
@@ -367,7 +402,7 @@ bb_init(void)
    bb_watch_exit();
    add(dev);
    g_registered = 1;
-   ilog("backboardd: Chlorophyll device registered (kernel ABI minor %u)%s", minor, crashtest ? ", CRASHTEST armed" : "");
+   ilog("backboardd: %s device registered (kernel ABI minor %u)%s", m2v ? "metal2vulkan" : "Chlorophyll", minor, crashtest ? ", CRASHTEST armed" : "");
    pthread_t th;
    pthread_create(&th, NULL, watchdog_bb, (void *)(intptr_t)crashtest);
    pthread_detach(th);
