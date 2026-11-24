@@ -107,7 +107,7 @@ write_state(int unclean, int alive)
 {
    FILE *f = fopen(g_state, "w");
    if (!f) return;
-   fprintf(f, "unclean=%d alive=%d boot=%s\n", unclean, alive, boot_id());
+   fprintf(f, "unclean=%d alive=%d boot=%s pid=%d\n", unclean, alive, boot_id(), getpid());
    fclose(f);
 }
 
@@ -499,11 +499,14 @@ bgmtl_inject_init(void)
       if (exists(F_OFF) || exists(g_off)) { ilog("%s: kill switch present, stock", [bid UTF8String]); return; }
       if (!exists(F_ARM)) { ilog("%s: not armed, stock", [bid UTF8String]); return; }
       // gate 3: the dead-man
-      int unclean = 0, alive = 1;
+      int unclean = 0, alive = 1, pid = 0;
       char boot[64] = "";
       FILE *f = fopen(g_state, "r");
-      if (f) { if (fscanf(f, "unclean=%d alive=%d boot=%63s", &unclean, &alive, boot) < 2) { unclean = 0; alive = 1; } fclose(f); }
+      if (f) { if (fscanf(f, "unclean=%d alive=%d boot=%63s pid=%d", &unclean, &alive, boot, &pid) < 2) { unclean = 0; alive = 1; } fclose(f); }
       if (!alive && strcmp(boot, boot_id()) != 0) { ilog("last launch was in an earlier boot: not counted as unclean"); alive = 1; }
+      // two instances of one bundle (Mercury's lock-screen and home-screen posters) share this file: a launch whose process still
+      // runs is not an unclean one (counting it tripped Mercury to stock after reboots)
+      if (!alive && pid > 0 && pid != getpid() && (kill(pid, 0) == 0 || errno == EPERM)) { ilog("last launch (pid %d) still runs: not counted as unclean", pid); alive = 1; }
       if (!alive) unclean++;
       if (unclean >= 2) trip("two unclean launches in a row");
       write_state(unclean, 0);
