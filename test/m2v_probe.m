@@ -3,6 +3,7 @@
 // clears a texture over an IOSurface (the dma-buf import) through a render pass, and reads both back.
 //   /var/root/m2v_probe            (log lines also in /private/var/tmp/m2v.log when that file exists)
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
@@ -26,6 +27,20 @@ main(void)
       printf("device: %s\n", dev ? [[dev name] UTF8String] : "refused (see /private/var/tmp/m2v.log)");
       if (!dev) return 1;
       id<MTLCommandQueue> q = [dev newCommandQueue];
+      // audit: _MTLDevice methods the device class does not override (a call to one runs Apple's base version, often nil)
+      if (getenv("M2V_AUDIT")) {
+         Class base = objc_getClass("_MTLDevice"), mine = object_getClass(dev);
+         unsigned nb = 0, nm = 0;
+         Method *bm = class_copyMethodList(base, &nb), *mm = class_copyMethodList(mine, &nm);
+         for (unsigned i = 0; i < nb; i++) {
+            SEL sel = method_getName(bm[i]);
+            int own = 0;
+            for (unsigned j = 0; j < nm && !own; j++) own = method_getName(mm[j]) == sel;
+            if (!own) printf("AUDIT device-base %s\n", sel_getName(sel));
+         }
+         free(bm); free(mm);
+         return 0;
+      }
       // an unknown selector is answered 0 and logged MISSING (libm2v's forwarding), never an abort
       long z1 = (long)[(id)dev performSelector:NSSelectorFromString(@"chlNoSuchDeviceMethod")];
       long z2 = (long)[(id)q performSelector:NSSelectorFromString(@"chlNoSuchQueueMethod")];

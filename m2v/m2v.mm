@@ -162,6 +162,20 @@ extern "C" __attribute__((visibility("default"))) id m2v_create_device(void)
 		}
 		m2v_log("device %s in %.0f ms (loader %s, cache %s)", device ? [[device name] UTF8String] : "refused",
 			(CFAbsoluteTimeGetCurrent() - t0) * 1000, self.dli_fname, cache);
+		/* debugging: the frontend's counters every 10 s into m2v.log while /private/var/tmp/m2v-telemetry exists */
+		if (device && access("/private/var/tmp/m2v-telemetry", F_OK) == 0)
+			dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+				for (;;) {
+					sleep(10);
+					static char text[8192];
+					native_bridge_metal_telemetry(text, sizeof(text));
+					for (char *line = text, *next; *line; line = next) {
+						next = strchr(line, '\n');
+						if (next) *next++ = 0; else next = line + strlen(line);
+						if (line[0] == 'J' || line[0] == 'G' || line[0] == 'T' || line[0] == 'S' || line[0] == 'V') m2v_log("tel %s", line);
+					}
+				}
+			});
 		if (device && strcmp(getprogname(), "backboardd") != 0)
 			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
 					    imp_implementationWithBlock(^BOOL(id me) {

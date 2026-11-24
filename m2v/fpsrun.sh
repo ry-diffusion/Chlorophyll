@@ -44,7 +44,8 @@ for i in 1 2 3; do T=13 P true; done
 start=$(P 'wc -l < /private/var/tmp/m2v.log' | tr -d ' ')
 P '/var/root/sweetwake home >/dev/null 2>&1; true'
 for i in $(seq 1 "$swipes"); do
-  P '/var/root/sweetwake swipe 360 450 50 450 300 >/dev/null 2>&1; /var/root/sweetwake swipe 50 450 360 450 300 >/dev/null 2>&1; true'
+  # home first: back on page 1, so a missed swipe cannot drift the pair onto the Today view
+  P '/var/root/sweetwake home >/dev/null 2>&1; /var/root/sweetwake swipe 360 450 50 450 300 >/dev/null 2>&1; /var/root/sweetwake swipe 50 450 360 450 300 >/dev/null 2>&1; true'
 done
 P "tail -n +${start:-1} /private/var/tmp/m2v.log | grep 'fps:'" > "/tmp/fpsrun-$label.txt" 2>/dev/null
 P "tail -n +${start:-1} /private/var/tmp/m2v.log | grep -E 'MISSING|refused|memory is gone|Lost' | cut -c1-160 | sort | uniq -c | sort -rn | head -8"
@@ -61,4 +62,7 @@ for proc, r in sorted(rows.items()):
     iv = [sum(x[i] for x in act) for i in range(1, 6)]
     tot = sum(iv) or 1
     print(f"{sys.argv[2]}: {proc:24s} {fps:5.1f} fps over {len(act):3d} active s, <=17ms {100*iv[0]/tot:4.0f}%, <=34ms {100*(iv[0]+iv[1]+iv[2])/tot:4.0f}%, draws/frame {sum(x[6] for x in act)//len(act)}")
+    heavy = [x for x in act if x[6] >= 140]
+    if heavy:
+        print(f"{sys.argv[2]}: {proc:24s} heavy (>=140 draws) {sum(x[0] for x in heavy)/len(heavy):5.1f} fps over {len(heavy)} s")
 EOF
