@@ -1,5 +1,5 @@
 diff --git a/userland/metal2/NativeBridgeMetalFrontend.mm b/userland/metal2/NativeBridgeMetalFrontend.mm
-index 96a3488..e85297b 100644
+index 96a3488..624a1cb 100644
 --- a/userland/metal2/NativeBridgeMetalFrontend.mm
 +++ b/userland/metal2/NativeBridgeMetalFrontend.mm
 @@ -22,10 +22,12 @@
@@ -259,7 +259,7 @@ index 96a3488..e85297b 100644
 +// Chlorophyll: CHL_M2V_MSAA1=1 (m2v-env, per process at its start) renders multisampled work single-sampled: multisample textures are
 +// made with one sample, pipelines and passes rasterize one, and a pass that would resolve renders straight into its resolve target.
 +// For posters whose 4x MSAA passes cost the A630 hundreds of ms a frame (Mercury); edges alias a little.
-+static bool chlMsaa1() {static const bool on=getenv("CHL_M2V_MSAA1")!=nullptr;return on;}
++static bool chlMsaa1() {static const bool on=[]{const char *v=getenv("CHL_M2V_MSAA1");return v && (!strcmp(v,"1") || strstr(v,getprogname()));}();return on;}   // "1" or a list of process names
  static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
   if(!d)return false;
   *out={(uint64_t)d.textureType,sweetNarrow(d.pixelFormat),d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
@@ -724,10 +724,24 @@ index 96a3488..e85297b 100644
   flushSurfaces(_surfaces);
   NSArray<id<MTLDrawable>> *drawables;
   @synchronized(self){drawables=[_presentDrawables copy];[_presentDrawables removeAllObjects];}
-@@ -1501,6 +1796,17 @@ - (void)finish {
+@@ -1499,8 +1794,31 @@ - (void)finish {
+  dispatch_queue_t queue=_queue.completionQueue;
+  if(queue)dispatch_async(queue,run);else run();
  }
++// Chlorophyll: CHL_M2V_MIN_FRAME_MS_<process name>=N (m2v-env) spaces that process's frames (command buffers with render passes) at
++// least N ms apart by waiting in commit. The GPU has one ring: MercuryPoster's ~0.4 s frames held backboardd's 20 ms ones behind
++// them, so lock/unlock ran at ~2 fps; paced, the wallpaper animates slower and the rest of the UI keeps the GPU.
++static void chlPaceFrame(bool frame) {
++ static const double minUs=[]{char n[96];snprintf(n,sizeof n,"CHL_M2V_MIN_FRAME_MS_%s",getprogname());const char *v=getenv(n);return v?atof(v)*1000:0.0;}();
++ if(!frame || minUs<=0)return;
++ static std::atomic<uint64_t> last{0};
++ const uint64_t now=nowUs(),prev=last.load();
++ if(prev && now-prev<(uint64_t)minUs)usleep((useconds_t)((uint64_t)minUs-(now-prev)));
++ last.store(nowUs());
++}
  - (void)commit {
   if(self.committed){NBLOG(@"native-metal: commit twice");return;}
++ chlPaceFrame(encodedWork.passes>0);
 + const uint64_t chlCommitBegan=nowUs();
 + struct ChlCommitTimer {uint64_t began;bool frame;~ChlCommitTimer(){if(frame){gChlCommitUs+=nowUs()-began;gChlTimedFrames++;}}} chlTimer{chlCommitBegan,encodedWork.passes>0};
 + // Chlorophyll: async commit (/private/var/tmp/m2v-async-commit, with m2v-defer): the shadow refresh and the submit run on the
@@ -742,7 +756,7 @@ index 96a3488..e85297b 100644
   if(_rotatedShadows.count && !self.encodeFailure){   // 0196: what CA drew in landscape, into the portrait surface
    NSArray *shadows=[_rotatedShadows allObjects];[_rotatedShadows removeAllObjects];
    for(NBTexture *shadow in shadows){
-@@ -1532,6 +1838,7 @@ - (void)commit {
+@@ -1532,6 +1850,7 @@ - (void)commit {
     const uint32_t index=(uint32_t)(gCommits.fetch_add(1)+1);self.commitIndex=index;
     CommitRecord &r=gCommitRing[index%32];
     r={};r.index=index;r.committedUs=self.committedUs;r.ageUs=self.committedUs-createdUs;r.work=encodedWork;
@@ -750,7 +764,7 @@ index 96a3488..e85297b 100644
     if(encodedWork.passes || encodedWork.draws || encodedWork.dispatches || encodedWork.blits){
      const uint64_t workIndex=++gWorkCommits;
      if(workIndex<=3 || workIndex%30==0){
-@@ -1550,10 +1857,30 @@ - (void)commit {
+@@ -1550,10 +1869,30 @@ - (void)commit {
    }
    [gInFlight addObject:self];
   }
@@ -781,7 +795,7 @@ index 96a3488..e85297b 100644
    const bool callbacks=nmb_command_buffer_on_completed(_handle,completed,context) &&
                         nmb_command_buffer_on_scheduled(_handle,scheduled,context);
    if(callbacks){
-@@ -1578,6 +1905,7 @@ - (void)commit {
+@@ -1578,6 +1917,7 @@ - (void)commit {
  - (void)waitUntilCompleted {
   if(!self.committed)return;
   const uint64_t began=nowUs();
@@ -789,7 +803,7 @@ index 96a3488..e85297b 100644
   if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
   dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
   gTimeWaitCompleted.add(began);
-@@ -1585,6 +1913,11 @@ - (void)waitUntilCompleted {
+@@ -1585,6 +1925,11 @@ - (void)waitUntilCompleted {
  - (void)waitUntilScheduled {
   if(!self.committed)return;
   const uint64_t began=nowUs();
@@ -801,7 +815,7 @@ index 96a3488..e85297b 100644
   if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
    NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
   }
-@@ -1598,7 +1931,9 @@ - (void)waitUntilScheduled {
+@@ -1598,7 +1943,9 @@ - (void)waitUntilScheduled {
    * (the GPU only, not the completed handlers, which may need this very thread). Not in backboardd, whose own
    * frames are shown through the kernel's swap, which already waits for the GPU.
    */
@@ -812,7 +826,7 @@ index 96a3488..e85297b 100644
   if(drawsToSurface && !windowServer && !self.failedLocally){
    nmb_command_buffer_wait(_handle,0);
    static std::atomic<uint64_t> waits{0};const uint64_t w=++waits;
-@@ -1636,6 +1971,8 @@ - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submissio
+@@ -1636,6 +1983,8 @@ - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submissio
  // GPU priorities are not applied (one hardware queue): reported as not applied.
  - (BOOL)setGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
  - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
@@ -821,7 +835,7 @@ index 96a3488..e85297b 100644
  - (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {(void)d;return [self commandBuffer];}
  @end
  
-@@ -1724,12 +2061,27 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+@@ -1724,12 +2073,27 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
    if(error)*error=nbError(@"foreign function");return false;
   }
   p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
@@ -850,7 +864,7 @@ index 96a3488..e85297b 100644
   p->topology=d.inputPrimitiveTopology;p->rasterization=d.rasterizationEnabled;
   if(MTLVertexDescriptor *v=d.vertexDescriptor) {
    for(unsigned i=0;i<31;i++) {
-@@ -1868,7 +2220,9 @@ - (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {
+@@ -1868,7 +2232,9 @@ - (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {
  
  static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &archives,NSError **error) {
   for(id archive in list) {
@@ -861,7 +875,7 @@ index 96a3488..e85297b 100644
    archives.push_back([(NBBinaryArchive *)archive handle]);
   }
   return true;
-@@ -2118,6 +2472,18 @@ - (MTLSize)maxThreadsPerThreadgroup {
+@@ -2118,6 +2484,18 @@ - (MTLSize)maxThreadsPerThreadgroup {
   uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))NBLOG(@"native-metal: maxThreadsPerThreadgroup: %@",lastError());
   return MTLSizeMake(s[0],s[1],s[2]);
  }
@@ -880,7 +894,7 @@ index 96a3488..e85297b 100644
  - (void)doesNotRecognizeSelector:(SEL)selector {
   if(gMissing)gMissing("NativeBridgeMetalDevice",sel_getName(selector));
   noteProblem([NSString stringWithFormat:@"missing device %s",sel_getName(selector)]);
-@@ -2158,6 +2524,27 @@ - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources c
+@@ -2158,6 +2536,27 @@ - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources c
  // gets the pitch its length implies where the required one does not fit.
  - (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {
   const size_t page=(size_t)getpagesize();
@@ -908,7 +922,7 @@ index 96a3488..e85297b 100644
   if(!bytes || !d || !length || ((uintptr_t)bytes&(page-1)) || d.textureType!=MTLTextureType2D || d.mipmapLevelCount>1 || d.arrayLength>1 || d.sampleCount>1){
    NBLOG(@"native-metal: newTextureWithBytesNoCopy refused (%p %lu type %lu levels %lu)",bytes,(unsigned long)length,(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount);
    return nil;
-@@ -2210,9 +2597,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
+@@ -2210,9 +2609,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
  }
  - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
   NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,pointer,length,options);
@@ -930,7 +944,7 @@ index 96a3488..e85297b 100644
   return (id<MTLBuffer>)buffer;
  }
  - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
-@@ -2442,30 +2841,62 @@ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)opt
+@@ -2442,30 +2853,62 @@ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)opt
  - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
                                                           reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
   if(reflection)*reflection=nil;
@@ -997,7 +1011,7 @@ index 96a3488..e85297b 100644
  - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
   return [(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error];
  }
-@@ -2481,6 +2912,11 @@ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)opt
+@@ -2481,6 +2924,11 @@ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)opt
   NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
   journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
   if(!handle){NBLOG(@"native-metal: render pipeline refused (vertex %@, fragment %@): %@",d.vertexFunction.name,d.fragmentFunction.name,lastError());
@@ -1009,7 +1023,7 @@ index 96a3488..e85297b 100644
    return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);}
   NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
   {// 0182: what the pipeline is, for the draw trace of full-screen surface textures
-@@ -2598,6 +3034,7 @@ static void waitGPUForTexture(id<MTLTexture> texture) {
+@@ -2598,6 +3046,7 @@ static void waitGPUForTexture(id<MTLTexture> texture) {
   NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
   for(NBCommandBuffer *commandBuffer in pending){
    if(commandBuffer.failedLocally || !commandBuffer.handle)continue;
@@ -1017,7 +1031,7 @@ index 96a3488..e85297b 100644
    if(nmb_command_buffer_uses_texture(commandBuffer.handle,[(NBTexture *)texture handle])!=0){
     nmb_command_buffer_wait(commandBuffer.handle,0);
     static std::atomic<uint64_t> waits{0};const uint64_t w=++waits;
-@@ -2646,6 +3083,45 @@ static void hookDrawables() {
+@@ -2646,6 +3095,45 @@ static void hookDrawables() {
   if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
   if(strcmp(getprogname(),"backboardd")!=0)hookDrawables();   // 0244
   if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}

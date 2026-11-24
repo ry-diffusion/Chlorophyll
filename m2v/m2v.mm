@@ -153,6 +153,15 @@ extern "C" __attribute__((visibility("default"))) id m2v_create_device(void)
 			}
 			fclose(ef);
 		}
+		/* debugging: CHL_M2V_STDERR=PATH (m2v-env) appends this process's stdout and stderr there (ir3's IR3_SHADER_DEBUG=fs disassembly) */
+		if (const char *ep = getenv("CHL_M2V_STDERR")) {
+			int fd = open(ep, O_WRONLY | O_APPEND | O_CREAT, 0666);
+			if (fd >= 0) {
+				dup2(fd, 1);
+				dup2(fd, 2);
+				close(fd);
+			}
+		}
 		CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
 		@try {
 			device = native_bridge_metal_open(self.dli_fname, cache, 0, missing);
