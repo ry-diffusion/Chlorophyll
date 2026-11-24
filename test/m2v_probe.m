@@ -404,6 +404,7 @@ main(void)
          IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
       }
       CFRelease(sf);
+      if (!getenv("M2V_ONLY_SWITCH")) {
       // 4. per-draw CPU cost: 1000 textured draws in one pass (vertex buffer offset, texture, sampler rebound each draw)
       {
          NSError *err = nil;
@@ -484,6 +485,71 @@ main(void)
                double f = (double)tb.numer / tb.denom / 1e3;
                printf("bench CA-like %d: 8 passes x 22 indexed draws: encode+end %.0f us (%.1f us/draw), commit+GPU %.0f us, status %ld\n", round,
                       (t1 - t0) * f, (t1 - t0) * f / 176, (t2 - t1) * f, (long)bcb.status);
+            }
+         }
+      }
+      }
+      // 5. the CA-like bench with the pipeline switched every draw, as CoreAnimation does (M2V_PIPES: how many pipelines are
+      //    cycled; default runs 1, 2, 4, 8): is the per-draw cost in backboardd (~95 us) the pipeline switches?
+      {
+         NSError *err = nil;
+         id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"/var/root/bg_render.metallib"] error:&err];
+         NSArray *fs = @[@"bg_fs_tex", @"bg_fs_color", @"bg_fs_tex_inline", @"bg_fs_tex_linear", @"bg_fs_tex3"];
+         NSMutableArray *pipes = [NSMutableArray array];
+         for (int blend = 0; blend < 2; blend++)
+            for (NSString *name in fs) {
+               MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+               pd.vertexFunction = [lib newFunctionWithName:@"bg_vs"];
+               pd.fragmentFunction = [lib newFunctionWithName:name];
+               pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+               pd.colorAttachments[0].blendingEnabled = blend;
+               pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+               pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+               id ps = pd.fragmentFunction ? [dev newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+               if (ps) [pipes addObject:ps];
+            }
+         MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:828 height:1792 mipmapped:NO];
+         rd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; rd.storageMode = MTLStorageModePrivate;
+         id<MTLTexture> rt = [dev newTextureWithDescriptor:rd];
+         MTLTextureDescriptor *td2 = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+         id<MTLTexture> tex[4]; for (int k = 0; k < 4; k++) tex[k] = [dev newTextureWithDescriptor:td2];
+         id<MTLSamplerState> smp = [dev newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
+         uint16_t idx[6] = {0, 1, 2, 2, 1, 3};
+         id<MTLBuffer> ib = [dev newBufferWithBytes:idx length:sizeof idx options:MTLResourceStorageModeShared];
+         float vbytes[32], fbytes[8];
+         for (int k = 0; k < 32; k++) vbytes[k] = (k % 8 < 2) ? 0.1f * (k % 4) : 1.0f;
+         for (int k = 0; k < 8; k++) fbytes[k] = 0.5f;
+         mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+         const double f = (double)tb.numer / tb.denom / 1e3;
+         int counts[4] = {1, 2, 4, 8}, nc = 4;
+         if (getenv("M2V_PIPES")) { counts[0] = atoi(getenv("M2V_PIPES")); nc = 1; }
+         printf("bench switch: %lu pipelines made\n", (unsigned long)pipes.count);
+         for (int c = 0; c < nc && pipes.count; c++) {
+            const int P = MIN(counts[c], (int)pipes.count);
+            const int rounds = getenv("M2V_ROUNDS") ? atoi(getenv("M2V_ROUNDS")) : 4;   // long runs to profile
+            for (int round = 0; round < rounds; round++) {
+               uint64_t t0 = mach_absolute_time();
+               id<MTLCommandBuffer> bcb = [q commandBuffer];
+               MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
+               rp2.colorAttachments[0].texture = rt; rp2.colorAttachments[0].loadAction = MTLLoadActionClear;
+               rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
+               id<MTLRenderCommandEncoder> re = [bcb renderCommandEncoderWithDescriptor:rp2];
+               for (int k = 0; k < 150; k++) {
+                  [re setRenderPipelineState:pipes[k % P]];
+                  [re setVertexBytes:vbytes length:sizeof vbytes atIndex:0];
+                  [re setFragmentBytes:fbytes length:sizeof fbytes atIndex:1];
+                  [re setFragmentTexture:tex[k & 3] atIndex:0];
+                  [re setFragmentTexture:tex[(k + 1) & 3] atIndex:3];
+                  [re setFragmentSamplerState:smp atIndex:0];
+                  [re drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:ib indexBufferOffset:0];
+               }
+               [re endEncoding];
+               uint64_t t1 = mach_absolute_time();
+               [bcb commit];
+               [bcb waitUntilCompleted];
+               uint64_t t2 = mach_absolute_time();
+               if (rounds <= 8 || round % 50 == 0) printf("bench switch %d pipelines, round %d: 150 draws encode+end %.0f us (%.1f us/draw), commit+GPU %.0f us, status %ld\n", P, round,
+                      (t1 - t0) * f, (t1 - t0) * f / 150, (t2 - t1) * f, (long)bcb.status);
             }
          }
       }
