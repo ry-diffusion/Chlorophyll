@@ -462,8 +462,19 @@ bgmtl_inject_init(void)
       unsigned minor = 0;
       int st = bgmtl_gpu_state(&minor);
       if (st != 1) { ilog("GPU state %d (1 = ready): staying stock", st); write_state(unclean, 1); return; }
-      // gate 5
-      id dev = bgmtl_create_device();
+      // gate 5. /private/var/tmp/bgmtl.m2v.<bundle id>: the trial device of metal2vulkan (libm2v.dylib, m2v/) instead of ours;
+      // the gates above, the dead-man and the GPU-lost watchdog stay; command-buffer failures are not counted for it.
+      id dev = nil;
+      char m2v[160];
+      snprintf(m2v, sizeof(m2v), "/private/var/tmp/bgmtl.m2v.%s", [bid UTF8String]);
+      if (exists(m2v)) {
+         void *h = dlopen("/usr/local/lib/bgmtl/libm2v.dylib", RTLD_NOW);
+         id (*create)(void) = h ? (id(*)(void))dlsym(h, "m2v_create_device") : NULL;
+         dev = create ? create() : nil;
+         ilog("%s: metal2vulkan device %s%s", [bid UTF8String], dev ? "made" : "refused: ", dev ? "" : (h ? "see m2v.log" : dlerror()));
+         if (!dev) { write_state(unclean, 1); return; }
+      } else
+         dev = bgmtl_create_device();
       if (!dev) { ilog("no device could be made (sandbox? GPU?): staying stock"); write_state(unclean, 1); return; }
       void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
       if (!add) { ilog("MTLAddDevice not found: staying stock"); write_state(unclean, 1); return; }

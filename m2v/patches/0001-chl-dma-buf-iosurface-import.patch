@@ -1,0 +1,195 @@
+diff --git a/userland/metal2/NativeBridgeMetalFrontend.mm b/userland/metal2/NativeBridgeMetalFrontend.mm
+index 96a3488..003bcbd 100644
+--- a/userland/metal2/NativeBridgeMetalFrontend.mm
++++ b/userland/metal2/NativeBridgeMetalFrontend.mm
+@@ -223,6 +223,7 @@ @interface NBBuffer : NBObject
+ @property(nonatomic) MTLResourceOptions options;
+ @property(nonatomic,copy) void (^deallocator)(void *,NSUInteger);
+ @property(nonatomic) void *wrapped;
++@property(nonatomic) void *shadowOf;   // Chlorophyll: a no-copy buffer our kernel cannot map (plain memory): GPU memory refreshed from these bytes at each commit
+ @property(nonatomic) IOSurfaceRef surfaceOwner; // keeps a shared import's CPU mapping alive
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
+ @property(nonatomic) NSUInteger heapOffset;
+@@ -244,7 +245,7 @@ - (void)dealloc {
+  if(_surfaceOwner)CFRelease(_surfaceOwner);
+ }
+ - (NSUInteger)length {return nmb_buffer_length(_handle);}
+-- (void *)contents {return nmb_buffer_contents(_handle);}
++- (void *)contents {return _shadowOf?_shadowOf:nmb_buffer_contents(_handle);}
+ - (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
+ - (MTLResourceOptions)resourceOptions {return _options;}
+ - (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
+@@ -265,6 +266,44 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
+ // and its retained surface prevent object/address reuse during a hit. A new
+ // mapping, allocation identity or size needs a separate import; ordinary
+ // caller-owned no-copy buffers do not enter this cache.
++// Chlorophyll: the libdrm stand-in's IOSurface import (gpu/freedreno-sweet SWEET_GPU_SEL_SURFACE_BO; chl_vk.c's struct
++// chl_sbo, the first fields of the kernel's struct sweet_gpu_surface_bo). The dma-buf is the surface's whole BO from its
++// base address, so only a request from that page can be answered; one at an offset (a second plane) is refused and the
++// runtime shadows that texture. Client memory of another process (WRAPPED) is mapped read-only with no tail page after it,
++// where the GPU's over-fetch faults (chl's SMMU faults of 2026-10-26): refused too.
++struct ChlSbo {uint32_t surface_id,handle;uint64_t size,iova;uint32_t offset,bytes_per_row,width,height,pixel_format,planes,flags;uint8_t rest[128-52];};
++static int chlSurfacePrime(void *ctx,void *start,uint64_t length,uint64_t granule,uint64_t *chunk) {
++ (void)granule;
++ static int (*prime)(int,ChlSbo *)=(int (*)(int,ChlSbo *))dlsym(RTLD_DEFAULT,"sweet_drm_surface_prime");
++ static int (*gemClose)(int,uint32_t)=(int (*)(int,uint32_t))dlsym(RTLD_DEFAULT,"sweet_drm_gem_close");
++ static int (*boSync)(int,uint32_t,uint64_t,uint64_t)=(int (*)(int,uint32_t,uint64_t,uint64_t))dlsym(RTLD_DEFAULT,"sweet_drm_bo_sync");
++ IOSurfaceRef sf=(IOSurfaceRef)ctx;
++ const uintptr_t page=(uintptr_t)getpagesize();
++ const uintptr_t base=(uintptr_t)IOSurfaceGetBaseAddress(sf)&~(page-1);
++ if((uintptr_t)start!=base){NBLOG(@"chl: IOSurface %u: pages at +0x%lx asked (a plane past the first): shadowed",IOSurfaceGetID(sf),(unsigned long)((uintptr_t)start-base));return -1;}
++ if(!prime){NBLOG(@"chl: no sweet_drm_surface_prime");return -1;}
++ ChlSbo sb={};
++ const int fd=prime((int)IOSurfaceGetID(sf),&sb);
++ if(fd<0){NBLOG(@"chl: the kernel would not describe IOSurface %u",IOSurfaceGetID(sf));return -1;}
++ const uint64_t have=(sb.size+page-1)&~(uint64_t)(page-1);
++ if((sb.flags&0x4) || have<length){
++  NBLOG(@"chl: IOSurface %u refused (%s, BO %llu bytes, %llu asked)",IOSurfaceGetID(sf),(sb.flags&0x4)?"another process's client memory":"too small",(unsigned long long)sb.size,(unsigned long long)length);
++  close(fd);
++  if(sb.handle && !(sb.flags&0x8) && gemClose)gemClose(-1,sb.handle);
++  return -1;
++ }
++ if(boSync)boSync(-1,sb.handle,0,0);   // the processor's dirty lines out before the GPU first reads or writes
++ *chunk=length;
++ return fd;
++}
++static void chlSurfaceRelease(void *ctx) {CFRelease((IOSurfaceRef)ctx);}
++static NSHashTable<NBBuffer *> *gShadows;
++static std::mutex gShadowLock;
++static void chlRefreshShadows() {
++ NSArray<NBBuffer *> *live;
++ {std::lock_guard<std::mutex> lock(gShadowLock);live=gShadows.allObjects;}
++ for(NBBuffer *b in live)memcpy(nmb_buffer_contents(b.handle),b.shadowOf,nmb_buffer_length(b.handle));
++}
+ static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
+ static std::mutex gSurfaceImportLock;
+ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+@@ -275,7 +314,8 @@ - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing o
+  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
+  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
+  if(buffer)return buffer;
+- NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,base,bytes,MTLResourceStorageModeShared);
++ // Chlorophyll: our Turnip imports no host pointers; the surface's pages go to Vulkan as its dma-buf (chlSurfacePrime).
++ NmbBuffer *handle=nmb_buffer_new_no_copy_dma_buf(gDevice,base,bytes,MTLResourceStorageModeShared,chlSurfacePrime,chlSurfaceRelease,(void *)CFRetain(surface));
+  if(!handle){NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+  buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
+  buffer.surfaceOwner=(IOSurfaceRef)CFRetain(surface);
+@@ -1109,6 +1149,16 @@ - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
+        destinationLevel:level destinationOrigin:MTLOriginMake(0,0,0)];
+  }
+ }
++// Chlorophyll: iOS 26's MercuryPoster copies whole slices and levels this way (sent before any draw; unanswered it aborted).
++- (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)d
++       destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)slices levelCount:(NSUInteger)levels {
++ for(NSUInteger i=0;i<slices;i++)for(NSUInteger l=0;l<levels;l++) {
++  const NSUInteger level=sl+l;
++  MTLSize size=MTLSizeMake(MAX(s.width>>level,(NSUInteger)1),MAX(s.height>>level,(NSUInteger)1),MAX(s.depth>>level,(NSUInteger)1));
++  [self copyFromTexture:s sourceSlice:ss+i sourceLevel:level sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size toTexture:d destinationSlice:ds+i
++       destinationLevel:dl+l destinationOrigin:MTLOriginMake(0,0,0)];
++ }
++}
+ - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
+             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
+      destinationOrigin:(MTLOrigin)dO {
+@@ -1501,6 +1551,7 @@ - (void)finish {
+ }
+ - (void)commit {
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
++ chlRefreshShadows();
+  if(_rotatedShadows.count && !self.encodeFailure){   // 0196: what CA drew in landscape, into the portrait surface
+   NSArray *shadows=[_rotatedShadows allObjects];[_rotatedShadows removeAllObjects];
+   for(NBTexture *shadow in shadows){
+@@ -2210,9 +2261,21 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
+ }
+ - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
+  NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,pointer,length,options);
++ // Chlorophyll: our kernel maps no plain user memory for the GPU, so such a buffer is a shadow (as Chlorophyll's own BGMTLBuffer):
++ // GPU memory with the caller's bytes, copied in again at every commit (chlRefreshShadows). shortcut: GPU writes are not copied
++ // back to the caller's bytes; add a write-back at completion if a client reads GPU results through its own pointer.
++ bool shadow=false;
++ if(!handle && pointer){handle=nmb_buffer_new(gDevice,length,options,pointer);shadow=handle!=nullptr;}
+  if(!handle){NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
+  buffer.wrapped=pointer;buffer.deallocator=deallocator;
++ if(shadow){
++  buffer.shadowOf=pointer;
++  std::lock_guard<std::mutex> lock(gShadowLock);
++  if(!gShadows)gShadows=[NSHashTable weakObjectsHashTable];
++  [gShadows addObject:buffer];
++  static std::once_flag said;std::call_once(said,[&]{NBLOG(@"chl: no-copy buffers of plain memory are shadows (first: %lu bytes)",(unsigned long)length);});
++ }
+  return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
+diff --git a/userland/metal2/bridge/NativeMetalObjects.h b/userland/metal2/bridge/NativeMetalObjects.h
+index cc22052..7e07d88 100644
+--- a/userland/metal2/bridge/NativeMetalObjects.h
++++ b/userland/metal2/bridge/NativeMetalObjects.h
+@@ -64,6 +64,9 @@ bool nmb_binary_archive_serialize(NmbBinaryArchive *, const char *path);
+ NmbBuffer *nmb_buffer_new(NmbDevice *, uint64_t length, uint64_t options, const void *bytes /* NULL: zeroed */);
+ /* Wraps page-aligned memory the caller keeps mapped until the buffer is released (an IOSurface's base, host pages). */
+ NmbBuffer *nmb_buffer_new_no_copy(NmbDevice *, void *pointer, uint64_t length, uint64_t options);
++/* Chlorophyll: the same over a dma-buf of the pages (prime(ctx, start, length, granule, &chunk_length) -> fd or -1; release(ctx) once). */
++NmbBuffer *nmb_buffer_new_no_copy_dma_buf(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
++                                          int (*prime)(void *, void *, uint64_t, uint64_t, uint64_t *), void (*release)(void *), void *ctx);
+ void nmb_buffer_release(NmbBuffer *);
+ void *nmb_buffer_contents(const NmbBuffer *);
+ uint64_t nmb_buffer_length(const NmbBuffer *);
+diff --git a/userland/metal2/bridge/NativeMetalObjects.rs b/userland/metal2/bridge/NativeMetalObjects.rs
+index d9d23cd..a0516c0 100644
+--- a/userland/metal2/bridge/NativeMetalObjects.rs
++++ b/userland/metal2/bridge/NativeMetalObjects.rs
+@@ -2105,3 +2105,53 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
+         Ok(true)
+     })
+ }
++
++// Chlorophyll (Poco F1): a no-copy buffer over an IOSurface whose pages reach Vulkan as a dma-buf. Our Turnip has no
++// VK_EXT_external_memory_host and our kernel no user-pointer BOs, so the runtime's pointer import is always refused and it
++// asks `prime` for the pages (metal2vulkan's DmaBufSource). `prime(ctx, start, length, granule, &chunk_length)` returns a
++// dma-buf fd whose bytes 0..chunk_length are the pages from `start`, or -1 (the runtime then refuses the buffer, or
++// shadows a texture). `release(ctx)` runs once the runtime lets go of the source.
++pub type NmbPrimeFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, *mut u64) -> i32;
++pub type NmbPrimeReleaseFn = unsafe extern "C" fn(*mut c_void);
++struct PrimeCtx(NmbPrimeFn, NmbPrimeReleaseFn, *mut c_void);
++// SAFETY: the context is the caller's (a retained IOSurfaceRef), usable from any thread.
++unsafe impl Send for PrimeCtx {}
++unsafe impl Sync for PrimeCtx {}
++impl Drop for PrimeCtx {
++    fn drop(&mut self) {
++        // SAFETY: the caller's contract: called once.
++        unsafe { (self.1)(self.2) }
++    }
++}
++
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_buffer_new_no_copy_dma_buf(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64,
++                                                        prime: NmbPrimeFn, release_ctx: NmbPrimeReleaseFn, ctx: *mut c_void)
++                                                        -> *mut NmbBuffer {
++    let holder = std::sync::Arc::new(PrimeCtx(prime, release_ctx, ctx));
++    guard(std::ptr::null_mut(), || {
++        use std::os::fd::FromRawFd;
++        let device = get(device)?;
++        let pointer = NonNull::new(pointer as *mut u8).ok_or("null memory")?;
++        let h = holder.clone();
++        let source: metal2vulkan_runtime::DmaBufSource = std::sync::Arc::new(move |req: metal2vulkan_runtime::DmaBufRequest| {
++            let mut chunk = 0u64;
++            // SAFETY: the caller's contract for `prime`.
++            let fd = unsafe { (h.0)(h.2, req.start.as_ptr() as *mut c_void, req.length, req.granule, &mut chunk) };
++            if fd < 0 || chunk == 0 {
++                return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
++            }
++            // SAFETY: `prime` hands over a fresh descriptor.
++            Ok(vec![metal2vulkan_runtime::DmaBufChunk { fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, length: chunk }])
++        });
++        // SAFETY: the caller keeps the surface's pages mapped while the buffer lives (it retains the surface).
++        let memory = unsafe { HostMemory::with_dma_buf(pointer, source) };
++        let modes = options(options_word)?;
++        let buffer = {
++            let _gate = device.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
++            // SAFETY: as above.
++            unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, None) }
++        };
++        Ok(boxed(NmbBuffer(buffer.map_err(e("dma-buf no-copy buffer"))?)))
++    })
++}
