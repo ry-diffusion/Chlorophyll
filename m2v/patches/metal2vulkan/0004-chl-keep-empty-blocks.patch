@@ -1,0 +1,175 @@
+Chlorophyll: empty pooled blocks are kept for a while, and a placement up to 3/4 of a block is pooled.
+
+backboardd (CoreAnimation) takes several framebuffer-sized targets per animation (828x1792 RGBA16F = 12 MB) and drops them
+after it. The runtime freed each emptied block past three and made new ones at the next animation: about three 16 MB
+kernel allocations per home-screen page swipe, 60-80 ms each in our kernel, on the display thread (35 % of its CPU time),
+and the frees on the completion thread. Now three empty blocks are always kept and, past three, the one empty the longest
+is freed once it has been empty for 5 s; a 12 MB target takes a kept 16 MB block instead of an allocation of its own.
+
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index 0caa5de..99939e1 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -47,11 +47,15 @@ use std::ptr::NonNull;
+ #[cfg(unix)]
+ use std::sync::Arc;
+ use std::sync::Mutex;
++use std::time::{Duration, Instant};
+ 
+ /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`. SweetMetal2: 8 MB, not 64: the A640's
+ /// kernel backs every block with RAM at once, and each process paid 64 MB per memory class it touched.
+ pub(super) const BLOCK_BYTES: u64 = 16 << 20;   // Chlorophyll: 16 MB, so an 828x1792 BGRA8 target (5.9 MB) is pooled, not dedicated
+ 
++/// How long an empty pooled block past the three always kept stays ([`Pool::release`]).
++const EMPTY_KEPT: Duration = Duration::from_secs(5);
++
+ /// What memory a resource needs.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub(super) enum MemoryClass {
+@@ -275,6 +279,8 @@ pub(super) struct Pool<T> {
+ struct PoolBlock<T> {
+     ranges: RangeAllocator,
+     dedicated: bool,
++    /// When it last emptied ([`Pool::release`]).
++    emptied: Instant,
+     payload: T,
+ }
+ 
+@@ -315,6 +321,7 @@ impl<T> Pool<T> {
+         let block = Some(PoolBlock {
+             ranges,
+             dedicated,
++            emptied: Instant::now(),
+             payload,
+         });
+         match self.blocks.iter().position(Option::is_none) {
+@@ -353,30 +360,42 @@ impl<T> Pool<T> {
+     /// must now be freed: a dedicated block, or a pooled block that emptied while another empty
+     /// pooled block is kept.
+     pub(super) fn release(&mut self, index: usize, offset: u64, size: u64) -> Option<T> {
++        self.release_at(index, offset, size, Instant::now())
++    }
++
++    /// [`Pool::release`] at `now`.
++    pub(super) fn release_at(
++        &mut self,
++        index: usize,
++        offset: u64,
++        size: u64,
++        now: Instant,
++    ) -> Option<T> {
+         let block = self.blocks.get_mut(index)?.as_mut()?;
+         block.ranges.free(offset, size);
+         if !block.ranges.is_empty() {
+             return None;
+         }
+-        // Chlorophyll: keep up to three empty pooled blocks (not one): CoreAnimation in backboardd makes and drops
+-        // framebuffer-sized targets every frame, and each freed block came straight back as a kernel allocation.
+-        let keep = !block.dedicated
+-            && self
+-                .blocks
+-                .iter()
+-                .enumerate()
+-                .filter(|(other, block)| {
+-                    *other != index
+-                        && block
+-                            .as_ref()
+-                            .is_some_and(|block| !block.dedicated && block.ranges.is_empty())
+-                })
+-                .count()
+-                < 3;
+-        if keep {
++        if block.dedicated {
++            return self.blocks[index].take().map(|block| block.payload);
++        }
++        block.emptied = now;
++        // Chlorophyll: three empty pooled blocks are always kept (not one), and past three the one empty the longest
++        // is freed once it has been empty for EMPTY_KEPT. CoreAnimation in backboardd takes several framebuffer-sized
++        // targets per animation and drops them after it, and making a block costs 60-80 ms in our kernel.
++        // shortcut: trims only when a block empties, so an idle process holds its empty blocks; add a timer if idle
++        // memory matters.
++        let empty = || {
++            (self.blocks.iter().enumerate()).filter_map(|(index, block)| {
++                let block = block.as_ref()?;
++                (!block.dedicated && block.ranges.is_empty()).then_some((block.emptied, index))
++            })
++        };
++        let (emptied, oldest) = empty().min()?;
++        if empty().count() <= 3 || now.saturating_duration_since(emptied) < EMPTY_KEPT {
+             return None;
+         }
+-        self.blocks[index].take().map(|block| block.payload)
++        self.blocks[oldest].take().map(|block| block.payload)
+     }
+ 
+     /// Every block's payload, emptying the pool.
+@@ -1382,7 +1401,9 @@ fn place(
+     if candidates.is_empty() {
+         return Err(Error::OutOfMemory(MemoryKind::Device));
+     }
+-    let dedicated = fit == Fit::Apart || size > maker.block_bytes / 2;
++    // Chlorophyll: up to 3/4 of a block (not 1/2) is pooled: an 828x1792 RGBA16F target (12 MB) then takes a kept
++    // 16 MB block, not a kernel allocation of its own that is freed with it.
++    let dedicated = fit == Fit::Apart || size > maker.block_bytes / 4 * 3;
+     let block_size = if dedicated { size } else { maker.block_bytes };
+     let mut failure = Error::OutOfMemory(MemoryKind::Device);
+     for type_index in candidates {
+diff --git a/crates/metal2vulkan-runtime/src/tests/memory.rs b/crates/metal2vulkan-runtime/src/tests/memory.rs
+index 53a1a65..67e1ecd 100644
+--- a/crates/metal2vulkan-runtime/src/tests/memory.rs
++++ b/crates/metal2vulkan-runtime/src/tests/memory.rs
+@@ -234,30 +234,33 @@ fn host_transfer_images_prefer_host_cached_memory() {
+     }
+ }
+ 
++/// Chlorophyll: three empty pooled blocks are always kept; past three, the one empty the longest is freed once it has
++/// been empty for five seconds.
+ #[test]
+-fn pooled_blocks_place_until_full_and_one_empty_block_is_kept() {
+-    let mut pool: Pool<&str> = Pool::default();
++fn pooled_blocks_place_until_full_and_empty_blocks_are_kept_for_a_while() {
++    use std::time::{Duration, Instant};
++    let mut pool: Pool<u32> = Pool::default();
+     assert_eq!(pool.place(16, 16), None, "no block yet");
+-    let first = pool.add(256, false, "first", 100);
+-    assert_eq!(pool.place(100, 64), Some((first, 128)));
++    let blocks: Vec<usize> = (0..5).map(|n| pool.add(256, false, n, 200)).collect();
+     assert_eq!(pool.place(100, 64), None, "full");
+-    let second = pool.add(256, false, "second", 200);
+-    assert_ne!(first, second);
+-    assert_eq!(pool.blocks(), 2);
+-    // Emptying the first block keeps it: it is the only empty pooled block.
+-    assert_eq!(pool.release(first, 0, 100), None);
+-    assert_eq!(pool.release(first, 128, 100), None);
+-    assert_eq!(pool.blocks(), 2);
+-    // Emptying the second while the first is empty frees the second.
+-    assert_eq!(pool.release(second, 0, 200), Some("second"));
+-    assert_eq!(pool.blocks(), 1);
+-    // The kept block serves the next request; its slot is reused for a new block.
+-    assert_eq!(pool.place(256, 1), Some((first, 0)));
+-    let third = pool.add(256, false, "third", 1);
+-    assert_eq!(third, second, "the freed slot is reused");
+-    let mut drained: Vec<&str> = pool.drain().collect();
+-    drained.sort_unstable();
+-    assert_eq!(drained, ["first", "third"]);
++    let start = Instant::now();
++    let at = |seconds| start + Duration::from_secs(seconds);
++    for &block in &blocks[..4] {
++        assert_eq!(pool.release_at(block, 0, 200, at(1)), None, "emptied a second ago at most");
++    }
++    assert_eq!(pool.blocks(), 5);
++    // The kept blocks serve the next requests, and emptying one again makes it the newest.
++    assert_eq!(pool.place(256, 1), Some((blocks[0], 0)));
++    assert_eq!(pool.release_at(blocks[0], 0, 256, at(4)), None);
++    // Past three empty blocks, the one empty the longest goes once five seconds have passed.
++    assert_eq!(pool.release_at(blocks[4], 0, 200, at(7)), Some(1));
++    assert_eq!(pool.blocks(), 4);
++    assert_eq!(pool.place(256, 1), Some((blocks[0], 0)));
++    assert_eq!(pool.release_at(blocks[0], 0, 256, at(20)), Some(2));
++    assert_eq!(pool.place(256, 1), Some((blocks[0], 0)));
++    assert_eq!(pool.release_at(blocks[0], 0, 256, at(40)), None, "three are kept");
++    assert_eq!(pool.add(256, false, 9, 1), blocks[1], "a freed slot is reused");
++    assert_eq!(pool.drain().count(), 4);
+     assert_eq!(pool.blocks(), 0);
+ }
+ 

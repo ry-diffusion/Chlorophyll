@@ -6,6 +6,7 @@
 # --reboot reboots (backboardd only restarts with the phone); then stale per-process kill switches are cleared, the phone
 # is unlocked, N page-swipe pairs run, and the fps meter's lines (/private/var/tmp/m2v-fps) are summarised per process:
 # mean frames/s over the seconds that had >= 5 frames, and the share of frame intervals <= 17 ms (60 fps) and <= 34 ms.
+# These are commits; the "panel:" line counts the frames the kernel framebuffer actually showed during the swipes.
 set -uo pipefail
 K="-o UserKnownHostsFile=$HOME/.ssh/known_hosts_ios26 -o ConnectTimeout=5"
 P() { timeout "${T:-20}" ssh $K root@192.168.7.2 "$@"; }
@@ -47,11 +48,22 @@ P 'cd /private/var/tmp; for b in com.apple.MercuryPoster com.apple.springboard; 
 P '/var/root/sweetwake wake >/dev/null 2>&1; /var/root/sweetwake unlock >/dev/null 2>&1; true'
 for i in 1 2 3; do T=13 P true; done
 start=$(P 'wc -l < /private/var/tmp/m2v.log' | tr -d ' ')
+# what reached the panel: the framebuffer's own counters (the meter below counts commits, shown or not)
+FB() { P '/var/root/sysctlget kern.sweet_fb' | tr ' ' '\n' | grep -E '^(swaps|coalesced|copy_frames|zc_frames|scan_gpu_copies|gpu_hold_timeouts)=' | tr '\n' ' '; }
+fb0=$(FB)
 P '/var/root/sweetwake home >/dev/null 2>&1; true'
 for i in $(seq 1 "$swipes"); do
   # home first: back on page 1, so a missed swipe cannot drift the pair onto the Today view
   P '/var/root/sweetwake home >/dev/null 2>&1; /var/root/sweetwake swipe 360 450 50 450 300 >/dev/null 2>&1; /var/root/sweetwake swipe 50 450 360 450 300 >/dev/null 2>&1; true'
 done
+fb1=$(FB)
+python3 - "$label" "$fb0" "$fb1" <<'EOF2'
+import sys
+a, b = (dict(kv.split('=') for kv in t.split()) for t in sys.argv[2:4])
+d = {k: int(b[k]) - int(a[k]) for k in a if k in b}
+shown = d.get('copy_frames', 0) + d.get('zc_frames', 0) + d.get('scan_gpu_copies', 0)
+print(f"{sys.argv[1]}: panel: {shown} frames shown of {d.get('swaps', 0)} swaps ({d.get('coalesced', 0)} replaced before shown, {d.get('gpu_hold_timeouts', 0)} shown at the GPU gate's cap)")
+EOF2
 P "tail -n +${start:-1} /private/var/tmp/m2v.log | grep 'fps:'" > "/tmp/fpsrun-$label.txt" 2>/dev/null
 P "tail -n +${start:-1} /private/var/tmp/m2v.log | grep -E 'MISSING|refused|memory is gone|Lost' | cut -c1-160 | sort | uniq -c | sort -rn | head -8"
 P '/var/root/sweetgpu | grep -oE "mhz=[0-9]+|busy_pct=[0-9]+|recoveries=[0-9]+|hangs=[0-9]+" | tr "\n" " "; echo'
