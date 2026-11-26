@@ -1,5 +1,8 @@
 # Chlorophyll
 
+> **Archived (2026-11-26).** Chlorophyll is retired. Its successor is [Crimson](https://github.com/ry-diffusion/Crimson) (branch `chlorophyll`, `ios/`): a fork of metal2vulkan that runs iOS 26 CoreAnimation on Turnip for Bergamota. The inject (`ios/inject`) and the Turnip build (`ios/turnip`, Mesa 26.2.5 without the AIR frontend) moved there; the phone no longer runs any code from this repository. Last working branches: `turnip` (iOS 26) and `main`.
+
+
 Chlorophyll is the Metal driver of [Bergamota](https://github.com/ry-diffusion/Bergamota) (iOS 18 on the Poco F1, Adreno 630).
 iOS apps and CoreAnimation ship their shaders as AIR (Apple's LLVM-based GPU IR) inside `.metallib` files; Chlorophyll
 translates AIR to Mesa's NIR and compiles it with freedreno's ir3 backend for the Adreno 630, and implements the
